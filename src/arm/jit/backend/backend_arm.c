@@ -15,7 +15,8 @@
 #define TEMPREGS_BASE 3
 #define TEMPREGS_COUNT 13
 #define SAVEDREGS_BASE 19
-#define SAVEDREGS_COUNT 10
+// x27-x29 are pinned while guest code runs, see jit_enter
+#define SAVEDREGS_COUNT 8
 
 // returns:
 // 0-31 : reg index
@@ -119,7 +120,7 @@ static void compileVFPWrite64(ArmCodeBackend* backend, ArmInstr instr,
 ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
                                           ArmCore* cpu) {
     ArmCodeBackend* backend = calloc(1, sizeof *backend);
-    backend->code = rasCreate(16384, 0);
+    backend->code = rasCreateInArena(16384);
     backend->cpu = cpu;
     backend->regalloc = regalloc;
 
@@ -320,6 +321,57 @@ ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
                 BLR(IP0);
                 break;
             }
+#ifdef JIT_FASTMEM
+            // guest memory is one host mapping, so these need no call
+            case IR_LOAD_MEM8: {
+                auto dst = DSTREG();
+                auto addr = LOADOP1();
+                LDRB(dst, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_LOAD_MEMS8: {
+                auto dst = DSTREG();
+                auto addr = LOADOP1();
+                LDRSB(dst, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_LOAD_MEM16: {
+                auto dst = DSTREG();
+                auto addr = LOADOP1();
+                LDRH(dst, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_LOAD_MEMS16: {
+                auto dst = DSTREG();
+                auto addr = LOADOP1();
+                LDRSH(dst, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_LOAD_MEM32: {
+                auto dst = DSTREG();
+                auto addr = LOADOP1();
+                LDR(dst, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_STORE_MEM8: {
+                auto addr = LOADOP1();
+                auto src = LOADOP2();
+                STRB(src, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_STORE_MEM16: {
+                auto addr = LOADOP1();
+                auto src = LOADOP2();
+                STRH(src, (R28, addr, UXTW()));
+                break;
+            }
+            case IR_STORE_MEM32: {
+                auto addr = LOADOP1();
+                auto src = LOADOP2();
+                STR(src, (R28, addr, UXTW()));
+                break;
+            }
+#else
             case IR_LOAD_MEM8: {
                 auto dst = DSTREG();
                 MOVX(R0, R29);
@@ -393,6 +445,7 @@ ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
                 BLR(IP0);
                 break;
             }
+#endif
             case IR_MOV: {
                 auto src = LOADOP2();
                 auto dst = DSTREG();
@@ -859,14 +912,11 @@ ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
             }
             case IR_BEGIN: {
 
-                PUSH(FP, LR);
-                for (int i = 0; i < backend->hralloc.count[REG_SAVED]; i += 2) {
-                    PUSH(R(SAVEDREGS_BASE + i), R(SAVEDREGS_BASE + i + 1));
-                }
+                // spike: jit_enter saved what C needs and pinned the cpu, so a block costs nothing
+                // to enter or leave, and blocks chain without saving anything for each other
                 int spdisp = SPDISP();
                 if (spdisp) SUBX(SP, SP, spdisp);
 
-                MOVX(R29, (uintptr_t) cpu);
                 L(looplabel);
 
                 break;
@@ -887,11 +937,6 @@ ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
 
                 int spdisp = SPDISP();
                 if (spdisp) ADDX(SP, SP, spdisp);
-                for (int i = (backend->hralloc.count[REG_SAVED] - 1) & ~1;
-                     i >= 0; i -= 2) {
-                    POP(R(SAVEDREGS_BASE + i), R(SAVEDREGS_BASE + i + 1));
-                }
-                POP(FP, LR);
 
                 if (inst.opcode == IR_END_LINK) {
                     LABEL(nolink);
@@ -909,7 +954,7 @@ ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
                     L(nolink);
                 }
 
-                RET();
+                BR(R27);
                 break;
             }
             default:
@@ -1091,10 +1136,14 @@ static void compileVFPLoadMem(ArmCodeBackend* backend, ArmInstr instr,
 
     if (instr.cp_data_trans.cpnum & 1) {
         for (int i = 0; i < rcount; i++) {
+#ifdef JIT_FASTMEM
+            LDRD(V0, (R28, addr, UXTW()));
+#else
             MOVX(R0, R29);
             MOV(R1, addr);
             LDRLX(IP0, lldf64);
             BLR(IP0);
+#endif
             STRD(V0, CPU(d[(vd + i) & 15]));
             if (i < rcount - 1) ADD(addr, addr, 8);
         }
@@ -1102,10 +1151,14 @@ static void compileVFPLoadMem(ArmCodeBackend* backend, ArmInstr instr,
         vd = vd << 1 | instr.cp_data_trans.n;
 
         for (int i = 0; i < rcount; i++) {
+#ifdef JIT_FASTMEM
+            LDRS(V0, (R28, addr, UXTW()));
+#else
             MOVX(R0, R29);
             MOV(R1, addr);
             LDRLX(IP0, lldf32);
             BLR(IP0);
+#endif
             STRS(V0, CPU(s[(vd + i) & 31]));
             if (i < rcount - 1) ADD(addr, addr, 4);
         }
@@ -1136,22 +1189,30 @@ static void compileVFPStoreMem(ArmCodeBackend* backend, ArmInstr instr,
 
     if (instr.cp_data_trans.cpnum & 1) {
         for (int i = 0; i < rcount; i++) {
+            LDRD(V0, CPU(d[(vd + i) & 15]));
+#ifdef JIT_FASTMEM
+            STRD(V0, (R28, addr, UXTW()));
+#else
             MOVX(R0, R29);
             MOV(R1, addr);
-            LDRD(V0, CPU(d[(vd + i) & 15]));
             LDRLX(IP0, lstf64);
             BLR(IP0);
+#endif
             if (i < rcount - 1) ADD(addr, addr, 8);
         }
     } else {
         vd = vd << 1 | instr.cp_data_trans.n;
 
         for (int i = 0; i < rcount; i++) {
+            LDRS(V0, CPU(s[(vd + i) & 31]));
+#ifdef JIT_FASTMEM
+            STRS(V0, (R28, addr, UXTW()));
+#else
             MOVX(R0, R29);
             MOV(R1, addr);
-            LDRS(V0, CPU(s[(vd + i) & 31]));
             LDRLX(IP0, lstf32);
             BLR(IP0);
+#endif
             if (i < rcount - 1) ADD(addr, addr, 4);
         }
     }
@@ -1251,6 +1312,7 @@ JITFunc backend_arm_get_code(ArmCodeBackend* backend) {
 
 void backend_arm_patch_links(JITBlock* block) {
     ArmCodeBackend* backend = block->backend;
+    rasSeal(backend->code);
     for (int i = 0; i < backend->links.size; i++) {
         auto patch = backend->links.d[i];
         JITBlock* linkblock =

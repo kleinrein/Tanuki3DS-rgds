@@ -127,3 +127,76 @@ void etc1a4_decompress_texture(u32 width, u32 height,
 
     flip_vertical(height, width * 4, (void*) dst);
 }
+
+// A block for the GPU's own ETC decoder: 3DS blocks are the same bits in the
+// other byte order. Textures are stored bottom row first here, so each block is
+// also flipped top to bottom. A difference of -4 between the top and bottom
+// colours has no +4 to flip into; it becomes +3, one step off on those pixels.
+u64 etc1_block_flip_y(u64 block, bool* clamped) {
+    etc1block b = {block};
+    u32 m = b.modidx;
+    m = (m & 0x5555) << 1 | (m >> 1 & 0x5555);
+    b.modidx = (m & 0x3333) << 2 | (m >> 2 & 0x3333);
+    m = b.modneg;
+    m = (m & 0x5555) << 1 | (m >> 1 & 0x5555);
+    b.modneg = (m & 0x3333) << 2 | (m >> 2 & 0x3333);
+    if (b.flip) {
+        // the two sub-blocks are above each other: they swap
+        int t = b.table1;
+        b.table1 = b.table2;
+        b.table2 = t;
+        if (b.diff) {
+#define FLIPDIFF(c)                                                            \
+    {                                                                          \
+        int d = b.d##c##2;                                                     \
+        b.d##c##1 = b.d##c##1 + d;                                             \
+        if (d == -4) {                                                         \
+            d = -3;                                                            \
+            *clamped = true;                                                   \
+        }                                                                      \
+        b.d##c##2 = -d;                                                        \
+    }
+            FLIPDIFF(r)
+            FLIPDIFF(g)
+            FLIPDIFF(b)
+#undef FLIPDIFF
+        } else {
+            t = b.r1, b.r1 = b.r2, b.r2 = t;
+            t = b.g1, b.g1 = b.g2, b.g2 = t;
+            t = b.b1, b.b1 = b.b2, b.b2 = t;
+        }
+    }
+    return b.d;
+}
+
+// false when a block would mean something else to an ETC2 decoder
+bool etc1_block_is_plain(u64 block) {
+    etc1block b = {block};
+    if (!b.diff) return true;
+    int r = b.dr1 + b.dr2, g = b.dg1 + b.dg2, bl = b.db1 + b.db2;
+    return r >= 0 && r <= 31 && g >= 0 && g <= 31 && bl >= 0 && bl <= 31;
+}
+
+// w and h in pixels, multiples of 8. dst holds w * h / 2 bytes. False when the
+// texture has to be decoded instead.
+bool etc1_to_gpu(u32 width, u32 height, const u64* src, int blockstep, u64* dst,
+                 int* clamped) {
+    u32 bw = width / 4, bh = height / 4;
+    for (u32 ty = 0; ty < height / 8; ty++) {
+        for (u32 tx = 0; tx < width / 8; tx++) {
+            for (u32 tty = 0; tty < 2; tty++) {
+                for (u32 ttx = 0; ttx < 2; ttx++) {
+                    u64 blk = *src;
+                    src += blockstep;
+                    if (!etc1_block_is_plain(blk)) return false;
+                    bool c = false;
+                    blk = etc1_block_flip_y(blk, &c);
+                    *clamped += c;
+                    u32 by = bh - 1 - (ty * 2 + tty), bx = tx * 2 + ttx;
+                    dst[by * bw + bx] = __builtin_bswap64(blk);
+                }
+            }
+        }
+    }
+    return true;
+}

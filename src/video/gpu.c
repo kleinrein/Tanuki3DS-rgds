@@ -10,6 +10,340 @@
 #include "shadergen_fs.h"
 
 #include "gpuptr.inc"
+#include "gpu_hash.h"
+
+#include <sched.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <unistd.h>
+
+// spike: the renderer on a second thread. The thread owns the whole GPU struct
+// and the gl context. The emulation thread never touches them: for each command
+// list it follows the jumps, copies the words into cmd_ring and copies each
+// draw's vertices and indices into a gl buffer, so the game can overwrite its
+// buffers right after the (immediate) interrupt. Textures are still read from
+// guest memory late.
+#define GW_MSGS (1u << 15)
+#define GW_SNAPS (1u << 14)
+#define GW_CMD_RING (16u << 20)
+#define GW_FLUSH_DRAWS 1024
+
+enum {
+    GW_CMDS,
+    GW_INVAL,
+    GW_REHASH,
+    GW_TRANSFER,
+    GW_LCD,
+    GW_TEXCOPY,
+    GW_CLEAR,
+    GW_START_FRAME,
+    GW_PRESENT,
+    GW_SYNC,
+    GW_QUIT,
+};
+
+typedef struct {
+    u32 type;
+    u32 a[8];
+} GWMsg;
+
+static struct {
+    bool on;
+    pthread_t thread;
+    void (*bind)(bool);
+    void (*present)(int, int);
+
+    GWMsg* msgs;
+    alignas(64) atomic_uint msg_head;
+    alignas(64) atomic_uint msg_tail;
+
+    u32* cmd;
+    u64 cmd_head;
+    alignas(64) _Atomic u64 cmd_tail;
+
+    DrawSnap* snaps;
+    u32 snap_head;
+    u32 snap_read;
+    alignas(64) atomic_uint snap_tail;
+    int pending_draws;
+
+    u32 presents;
+    alignas(64) atomic_uint presents_done;
+
+    GPURegs regs; // what the command lists have written so far
+
+    bool skip;
+    bool can_skip;
+    u32 behind_sum, behind_n;
+    u64 last_present;
+    _Atomic u64 maxgap;
+    u32 skip_after;
+    atomic_int drawn, transfers, lost;
+    bool new_image, only_new;
+
+    _Atomic u64 busy_ns, present_ns;
+    u64 wait_ns;
+    atomic_int copies, wraps;
+} g_w;
+
+static thread_local bool g_is_worker;
+void spike_gap_hook(double ms);
+
+static u64 gw_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+static inline void gw_relax(int* n) {
+    if ((*n)++ < 2000) {
+        sched_yield();
+    } else {
+        usleep(20);
+    }
+}
+
+static void gw_push(u32 type, u32 a0, u32 a1, u32 a2, u32 a3, u32 a4, u32 a5,
+                    u32 a6, u32 a7) {
+    u32 head = atomic_load_explicit(&g_w.msg_head, memory_order_relaxed);
+    if (head - atomic_load_explicit(&g_w.msg_tail, memory_order_acquire) >=
+        GW_MSGS) {
+        u64 t0 = gw_now();
+        int n = 0;
+        while (head - atomic_load_explicit(&g_w.msg_tail,
+                                           memory_order_acquire) >= GW_MSGS)
+            gw_relax(&n);
+        g_w.wait_ns += gw_now() - t0;
+    }
+    g_w.msgs[head % GW_MSGS] =
+        (GWMsg) {type, {a0, a1, a2, a3, a4, a5, a6, a7}};
+    atomic_store_explicit(&g_w.msg_head, head + 1, memory_order_release);
+}
+
+bool gpu_worker_is_this_thread() {
+    return g_is_worker;
+}
+
+bool gpu_worker_on() {
+    return g_w.on;
+}
+
+double gpu_worker_maxgap() {
+    return atomic_exchange(&g_w.maxgap, 0) / 1e6;
+}
+
+double gpu_worker_behind() {
+    double r = g_w.behind_n ? (double) g_w.behind_sum / g_w.behind_n : 0;
+    g_w.behind_sum = g_w.behind_n = 0;
+    return r;
+}
+
+int gpu_worker_lost() {
+    return atomic_exchange(&g_w.lost, 0);
+}
+
+int gpu_worker_transfers() {
+    return atomic_exchange(&g_w.transfers, 0);
+}
+
+int gpu_worker_drawn() {
+    return atomic_exchange(&g_w.drawn, 0);
+}
+
+void gpu_worker_stats(double* busy, double* present, double* wait, int* copies,
+                      int* wraps) {
+    *busy = atomic_exchange(&g_w.busy_ns, 0) / 1e6;
+    *present = atomic_exchange(&g_w.present_ns, 0) / 1e6;
+    *wait = g_w.wait_ns / 1e6;
+    g_w.wait_ns = 0;
+    *copies = atomic_exchange(&g_w.copies, 0);
+    *wraps = atomic_exchange(&g_w.wraps, 0);
+}
+
+// waits until the thread has run everything pushed so far
+void gpu_worker_sync(bool finish) {
+    if (!g_w.on || g_is_worker) {
+        if (finish) glFinish();
+        return;
+    }
+    if (finish) atomic_fetch_add(&g_w.wraps, 1);
+    gw_push(GW_SYNC, finish, 0, 0, 0, 0, 0, 0, 0);
+    u32 head = atomic_load_explicit(&g_w.msg_head, memory_order_relaxed);
+    u64 t0 = gw_now();
+    int n = 0;
+    while (atomic_load_explicit(&g_w.msg_tail, memory_order_acquire) != head)
+        gw_relax(&n);
+    g_w.wait_ns += gw_now() - t0;
+}
+
+void gpu_worker_start_frame(GPU* gpu) {
+    if (g_w.on) {
+        g_w.behind_sum += g_w.presents -
+                          atomic_load_explicit(&g_w.presents_done, memory_order_acquire);
+        g_w.behind_n++;
+        // the renderer is still on the previous frame: run this one for its
+        // game logic only
+        bool skip = g_w.can_skip &&
+                    g_w.presents - atomic_load_explicit(&g_w.presents_done,
+                                                        memory_order_acquire) >=
+                        g_w.skip_after;
+        gw_push(GW_START_FRAME, skip, 0, 0, 0, 0, 0, 0, 0);
+    } else {
+        gpu_gl_start_frame(gpu);
+    }
+}
+
+// the game may run one whole frame ahead of what is on screen, no more
+void gpu_worker_present(int w, int h) {
+    gw_push(GW_PRESENT, w, h, 0, 0, 0, 0, 0, 0);
+    g_w.presents++;
+    g_vstream_presents++;
+    u64 t0 = gw_now();
+    int n = 0;
+    // with skipping the rule is only there to stop runaway queues
+    u32 ahead = g_w.can_skip ? 6 : 1;
+    while (atomic_load_explicit(&g_w.presents_done, memory_order_acquire) + ahead <
+           g_w.presents)
+        gw_relax(&n);
+    g_w.wait_ns += gw_now() - t0;
+}
+
+static void gw_exec_cmds(GPU* gpu, u32* cur, u32* end);
+static void gw_invalidate(GPU* gpu, u32 paddr, u32 len);
+static void gw_rehash(GPU* gpu);
+
+static void* gw_main(void* arg) {
+    GPU* gpu = arg;
+    g_is_worker = true;
+    if (getenv("SPIKE_PIN")) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(2, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+    g_w.bind(true);
+    int idle = 0;
+    bool quit = false;
+    while (!quit) {
+        u32 tail = atomic_load_explicit(&g_w.msg_tail, memory_order_relaxed);
+        if (tail == atomic_load_explicit(&g_w.msg_head, memory_order_acquire)) {
+            gw_relax(&idle);
+            continue;
+        }
+        idle = 0;
+        u64 t0 = gw_now();
+        GWMsg m = g_w.msgs[tail % GW_MSGS];
+        u32* a = m.a;
+        switch (m.type) {
+            case GW_CMDS: {
+                u32* cmds = g_w.cmd + a[0] / 4;
+                gw_exec_cmds(gpu, cmds, cmds + a[1]);
+                atomic_store_explicit(&g_w.cmd_tail,
+                                      a[2] | (u64) a[3] << 32,
+                                      memory_order_release);
+                break;
+            }
+            case GW_INVAL:
+                gw_invalidate(gpu, a[0], a[1]);
+                break;
+            case GW_REHASH:
+                gw_rehash(gpu);
+                break;
+            case GW_TRANSFER:
+                atomic_fetch_add(&g_w.transfers, a[5] == 0);
+                if (!g_w.skip) {
+                    gpu_gl_display_transfer(gpu, a[0], a[1], a[2], a[3], a[4], a[5]);
+                    g_w.new_image = true;
+                } else if (a[5] == 0) {
+                    atomic_fetch_add(&g_w.lost, 1);
+                }
+                break;
+            case GW_LCD:
+                gpu_gl_render_lcd_fb(gpu, a[0], a[1], a[2]);
+                g_w.new_image = true;
+                break;
+            case GW_TEXCOPY:
+                gpu_gl_texture_copy(gpu, a[0], a[1], a[2], a[3], a[4], a[5],
+                                    a[6]);
+                break;
+            case GW_CLEAR:
+                if (!g_w.skip) gpu_gl_clear_fb(gpu, a[0], a[1], a[2], a[3]);
+                break;
+            case GW_START_FRAME:
+                g_w.skip = a[0];
+                if (!g_w.skip) gpu_gl_start_frame(gpu);
+                break;
+            case GW_PRESENT: {
+                // A game at 30 fps leaves every other refresh with nothing new: presenting it again
+                // would only take time from the frame after it.
+                extern bool rgds_bridge_wants_present();
+                if (!g_w.skip && (g_w.new_image || !g_w.only_new || rgds_bridge_wants_present())) {
+                    g_w.new_image = false;
+                    g_w.present(a[0], a[1]);
+                    gpu_gl_frame_fence();
+                    atomic_fetch_add(&g_w.drawn, 1);
+                    u64 now = gw_now();
+                    if (g_w.last_present && now - g_w.last_present > atomic_load(&g_w.maxgap)) {
+                        atomic_store(&g_w.maxgap, now - g_w.last_present);
+                    }
+                    if (g_w.last_present) spike_gap_hook((now - g_w.last_present) / 1e6);
+                    g_w.last_present = now;
+                }
+                atomic_fetch_add_explicit(&g_w.presents_done, 1,
+                                          memory_order_release);
+                atomic_fetch_add(&g_w.present_ns, gw_now() - t0);
+                break;
+            }
+            case GW_SYNC:
+                if (a[0]) glFinish();
+                break;
+            case GW_QUIT:
+                quit = true;
+                break;
+        }
+        atomic_store_explicit(&g_w.msg_tail, tail + 1, memory_order_release);
+        atomic_fetch_add(&g_w.busy_ns, gw_now() - t0);
+    }
+    g_w.bind(false);
+    return nullptr;
+}
+
+void gpu_worker_start(GPU* gpu, void (*bind)(bool), void (*present)(int, int)) {
+    if (g_w.on) return;
+    if (!g_w.msgs) {
+        g_w.msgs = malloc(GW_MSGS * sizeof(GWMsg));
+        g_w.cmd = malloc(GW_CMD_RING);
+        g_w.snaps = malloc(GW_SNAPS * sizeof(DrawSnap));
+    }
+    atomic_store(&g_w.msg_head, 0);
+    atomic_store(&g_w.msg_tail, 0);
+    g_w.cmd_head = 0;
+    atomic_store(&g_w.cmd_tail, 0);
+    g_w.snap_head = g_w.snap_read = 0;
+    atomic_store(&g_w.snap_tail, 0);
+    g_w.pending_draws = 0;
+    g_w.presents = 0;
+    atomic_store(&g_w.presents_done, 0);
+    memcpy(&g_w.regs, &gpu->regs, sizeof g_w.regs);
+    g_w.bind = bind;
+    g_w.present = present;
+    bind(false);
+    g_w.can_skip = getenv("SPIKE_SKIP") != nullptr;
+    g_w.skip_after = g_w.can_skip ? atoi(getenv("SPIKE_SKIP")) : 1;
+    g_w.skip = false;
+    g_w.new_image = true;
+    g_w.only_new = !getenv("SPIKE_PRESENT_ALL");
+    g_w.on = true;
+    pthread_create(&g_w.thread, nullptr, gw_main, gpu);
+}
+
+void gpu_worker_stop() {
+    if (!g_w.on) return;
+    gw_push(GW_QUIT, 0, 0, 0, 0, 0, 0, 0, 0);
+    pthread_join(g_w.thread, nullptr);
+    g_w.on = false;
+    g_w.bind(true);
+}
 
 void gpu_init(GPU* gpu) {
     LRU_init(gpu->fbs);
@@ -26,6 +360,7 @@ void gpu_init(GPU* gpu) {
 }
 
 void gpu_destroy(GPU* gpu) {
+    gpu_worker_stop();
     renderer_gl_destroy(&gpu->gl, gpu);
 
     shaderjit_free_all(gpu);
@@ -43,12 +378,15 @@ void gpu_write_internalreg(GPU* gpu, u16 id, u32 param, u32 mask) {
     gpu->regs.w[id] |= param & mask;
     switch (id) {
         case GPUREG(geom.cmdbuf.jmp[0]):
-            gpu_run_command_list(gpu, gpu->regs.geom.cmdbuf.addr[0] << 3,
-                                 gpu->regs.geom.cmdbuf.size[0] << 3);
+            // with the thread on, the jumps were followed when copying the list
+            if (!g_w.on)
+                gpu_run_command_list(gpu, gpu->regs.geom.cmdbuf.addr[0] << 3,
+                                     gpu->regs.geom.cmdbuf.size[0] << 3);
             return;
         case GPUREG(geom.cmdbuf.jmp[1]):
-            gpu_run_command_list(gpu, gpu->regs.geom.cmdbuf.addr[1] << 3,
-                                 gpu->regs.geom.cmdbuf.size[1] << 3);
+            if (!g_w.on)
+                gpu_run_command_list(gpu, gpu->regs.geom.cmdbuf.addr[1] << 3,
+                                     gpu->regs.geom.cmdbuf.size[1] << 3);
             return;
         case GPUREG(geom.drawarrays):
             gpu_draw(gpu, false, false);
@@ -280,7 +618,7 @@ void gpu_write_internalreg(GPU* gpu, u16 id, u32 param, u32 mask) {
     }
 }
 
-void gpu_reset_needs_rehesh(GPU* gpu) {
+static void gw_rehash(GPU* gpu) {
     // this is called every time gsp starts a new command list, since
     // the cpu cant modify a texture within a command list, so no need to rehash
     // textures more often than that
@@ -289,15 +627,15 @@ void gpu_reset_needs_rehesh(GPU* gpu) {
     }
 }
 
-void gpu_run_command_list(GPU* gpu, u32 paddr, u32 size) {
+void gpu_reset_needs_rehesh(GPU* gpu) {
+    if (g_w.on) {
+        gw_push(GW_REHASH, 0, 0, 0, 0, 0, 0, 0, 0);
+    } else {
+        gw_rehash(gpu);
+    }
+}
 
-    paddr &= ~15;
-    size &= ~15;
-
-    u32* cmds = PTR(paddr);
-
-    u32* cur = cmds;
-    u32* end = cmds + (size / 4);
+static void gw_exec_cmds(GPU* gpu, u32* cur, u32* end) {
     while (cur < end) {
         GPUCommand c = {cur[1]};
         u32 mask = 0;
@@ -316,6 +654,165 @@ void gpu_run_command_list(GPU* gpu, u32 paddr, u32 size) {
         // each command must be 8 byte aligned
         if (c.nparams & 1) cur++;
     }
+}
+
+// copies one draw's guest data out, the same ranges the draw will use
+static void gw_snap_draw(GPU* gpu, GPURegs* regs, bool elements, DrawSnap* snap) {
+    int basevert = regs->geom.vtx_off;
+    int nbufverts = regs->geom.nverts;
+    snap->minind = snap->maxind = 0;
+    snap->index = 0;
+    snap->vhash = snap->ihash = 0;
+    if (elements) {
+        u32 minind = 0xffff, maxind = 0;
+        void* indexbuf = PTR(regs->geom.attr_base * 8 + regs->geom.indexbufoff);
+        bool indexsize = regs->geom.indexfmt;
+        int nverts = regs->geom.nverts;
+        if (indexsize) {
+            u16* ind = indexbuf;
+            for (int i = 0; i < nverts; i++) {
+                if (ind[i] < minind) minind = ind[i];
+                if (ind[i] > maxind) maxind = ind[i];
+            }
+        } else {
+            u8* ind = indexbuf;
+            for (int i = 0; i < nverts; i++) {
+                if (ind[i] < minind) minind = ind[i];
+                if (ind[i] > maxind) maxind = ind[i];
+            }
+        }
+        if (!nverts) minind = maxind = 0;
+        snap->index = gpu_gl_vstream_put(indexbuf, nverts * BIT(indexsize), 4);
+        if (g_draw_dump) snap->ihash = XXH3_64bits(indexbuf, nverts * BIT(indexsize));
+        snap->minind = minind;
+        snap->maxind = maxind;
+        basevert = minind;
+        nbufverts = maxind + 1 - minind;
+    }
+    for (int vbo = 0; vbo < 12; vbo++) {
+        if (regs->geom.attrbuf[vbo].count == 0) continue;
+        void* data =
+            PTR(regs->geom.attr_base * 8 + regs->geom.attrbuf[vbo].offset);
+        u32 stride = regs->geom.attrbuf[vbo].size;
+        snap->vbo[vbo] = gpu_gl_vstream_put(data + basevert * stride,
+                                            nbufverts * stride, 16);
+        if (g_draw_dump) snap->vhash ^= XXH3_64bits(data + basevert * stride, nbufverts * stride);
+    }
+}
+
+static void gw_flush(u32* from, u32* to) {
+    size_t bytes = (to - from) * 4;
+    if (bytes > GW_CMD_RING) {
+        lerror("command list too long");
+        return;
+    }
+    atomic_thread_fence(memory_order_release);
+    if (bytes) {
+        u64 head = g_w.cmd_head;
+        size_t pos = head % GW_CMD_RING;
+        if (pos + bytes > GW_CMD_RING) {
+            head += GW_CMD_RING - pos;
+            pos = 0;
+        }
+        if (head + bytes - atomic_load_explicit(&g_w.cmd_tail,
+                                                memory_order_acquire) >
+            GW_CMD_RING) {
+            u64 t0 = gw_now();
+            int n = 0;
+            while (head + bytes - atomic_load_explicit(&g_w.cmd_tail,
+                                                       memory_order_acquire) >
+                   GW_CMD_RING)
+                gw_relax(&n);
+            g_w.wait_ns += gw_now() - t0;
+        }
+        memcpy((u8*) g_w.cmd + pos, from, bytes);
+        head += bytes;
+        g_w.cmd_head = head;
+        gw_push(GW_CMDS, pos, bytes / 4, head, head >> 32, 0, 0, 0, 0);
+    }
+    g_w.pending_draws = 0;
+    if (g_w.snap_head - atomic_load_explicit(&g_w.snap_tail,
+                                             memory_order_acquire) >
+        GW_SNAPS - 2 * GW_FLUSH_DRAWS) {
+        u64 t0 = gw_now();
+        int n = 0;
+        while (g_w.snap_head - atomic_load_explicit(&g_w.snap_tail,
+                                                    memory_order_acquire) >
+               GW_SNAPS - 2 * GW_FLUSH_DRAWS)
+            gw_relax(&n);
+        g_w.wait_ns += gw_now() - t0;
+    }
+}
+
+static inline void gw_front_write(GPU* gpu, u32 id, u32 param, u32 mask,
+                                  int* jump) {
+    if (id >= GPUREG_MAX) return;
+    g_w.regs.w[id] = (g_w.regs.w[id] & ~mask) | (param & mask);
+    switch (id) {
+        case GPUREG(geom.cmdbuf.jmp[0]):
+            *jump = 0;
+            break;
+        case GPUREG(geom.cmdbuf.jmp[1]):
+            *jump = 1;
+            break;
+        case GPUREG(geom.drawarrays):
+        case GPUREG(geom.drawelements):
+            gw_snap_draw(gpu, &g_w.regs, id == GPUREG(geom.drawelements),
+                         &g_w.snaps[g_w.snap_head++ % GW_SNAPS]);
+            g_w.pending_draws++;
+            break;
+    }
+}
+
+static void gw_front_walk(GPU* gpu, u32 paddr, u32 size, int depth) {
+    paddr &= ~15;
+    size &= ~15;
+
+    u32* cur = PTR(paddr);
+    u32* end = cur + (size / 4);
+    u32* run = cur;
+    while (cur < end) {
+        GPUCommand c = {cur[1]};
+        u32 mask = 0;
+        if (c.mask & BIT(0)) mask |= 0xff << 0;
+        if (c.mask & BIT(1)) mask |= 0xff << 8;
+        if (c.mask & BIT(2)) mask |= 0xff << 16;
+        if (c.mask & BIT(3)) mask |= 0xff << 24;
+
+        int jump = -1;
+        u32 id = c.id;
+        gw_front_write(gpu, id, cur[0], mask, &jump);
+        cur += 2;
+        if (c.incmode) id++;
+        for (int i = 0; i < c.nparams; i++) {
+            gw_front_write(gpu, id, *cur++, mask, &jump);
+            if (c.incmode) id++;
+        }
+        if (c.nparams & 1) cur++;
+
+        if (jump >= 0 || g_w.pending_draws >= GW_FLUSH_DRAWS) {
+            gw_flush(run, cur);
+            run = cur;
+            if (jump >= 0 && depth < 20000) { // games chain lists through jumps, deeply
+                gw_front_walk(gpu, g_w.regs.geom.cmdbuf.addr[jump] << 3,
+                              g_w.regs.geom.cmdbuf.size[jump] << 3, depth + 1);
+            }
+        }
+    }
+    gw_flush(run, cur);
+}
+
+void gpu_run_command_list(GPU* gpu, u32 paddr, u32 size) {
+    if (g_w.on) {
+        gw_front_walk(gpu, paddr, size, 0);
+        return;
+    }
+
+    paddr &= ~15;
+    size &= ~15;
+
+    u32* cmds = PTR(paddr);
+    gw_exec_cmds(gpu, cmds, cmds + (size / 4));
 }
 
 // searches the framebuffer cache and return nullptr if not found
@@ -350,34 +847,63 @@ TexInfo* gpu_texcache_find_within(GPU* gpu, u32 paddr) {
 
 // the first wall of defense for texture cache invalidation
 void gpu_invalidate_range(GPU* gpu, u32 paddr, u32 len) {
+    if (g_w.on && !g_is_worker) {
+        gw_push(GW_INVAL, paddr, len, 0, 0, 0, 0, 0, 0);
+        return;
+    }
+    gw_invalidate(gpu, paddr, len);
+}
+
+static void gw_invalidate(GPU* gpu, u32 paddr, u32 len) {
     linfo("invalidating cache at %08x-%08x", paddr, paddr + len);
 
     // probably should optimize this at some point to not be linear
     for (int i = 0; i < TEX_MAX; i++) {
         auto t = &gpu->textures.d[i];
-        if ((t->paddr <= paddr && paddr < t->paddr + t->size) ||
-            (t->paddr < paddr + len && paddr + len <= t->paddr + t->size)) {
-            LRU_remove(gpu->textures, t);
-        }
+        // The same bytes are often written again (3D Land copies its textures to VRAM each frame):
+        // whether that matters is decided by a hash on the next use.
+        if (t->paddr && t->paddr < paddr + len && paddr < t->paddr + t->size) t->stale = true;
     }
 }
 
 void gpu_display_transfer(GPU* gpu, u32 paddr, int yoff, bool scalex,
                           bool scaley, bool vflip, int screenid) {
+    if (g_w.on) {
+        gw_push(GW_TRANSFER, paddr, yoff, scalex, scaley, vflip, screenid, 0, 0);
+        return;
+    }
     gpu_gl_display_transfer(gpu, paddr, yoff, scalex, scaley, vflip, screenid);
 }
 
 void gpu_render_lcd_fb(GPU* gpu, u32 paddr, u32 fmt, int screenid) {
+    if (g_w.on) {
+        gw_push(GW_LCD, paddr, fmt, screenid, 0, 0, 0, 0, 0);
+        return;
+    }
     gpu_gl_render_lcd_fb(gpu, paddr, fmt, screenid);
 }
 
 void gpu_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
                       u32 srcpitch, u32 srcgap, u32 dstpitch, u32 dstgap) {
+    if (g_w.on) {
+        // reads and writes guest memory the game may reuse right after
+        atomic_fetch_add(&g_w.copies, 1);
+        gw_push(GW_TEXCOPY, srcpaddr, dstpaddr, size, srcpitch, srcgap, dstpitch,
+                dstgap, 0);
+        // the copy still reads guest memory late; waiting here costs a third of a frame
+        if (getenv("SPIKE_COPYSYNC")) gpu_worker_sync(false);
+        return;
+    }
     gpu_gl_texture_copy(gpu, srcpaddr, dstpaddr, size, srcpitch, srcgap,
                         dstpitch, dstgap);
 }
 
 void gpu_clear_fb(GPU* gpu, u32 paddr, u32 len, u32 value, u32 datasz) {
+    if (g_w.on) {
+        gw_push(GW_CLEAR, paddr, len, value, datasz, 0, 0, 0, 0);
+        if (getenv("SPIKE_CLEARSYNC")) gpu_worker_sync(false);
+        return;
+    }
     gpu_gl_clear_fb(gpu, paddr, len, value, datasz);
 }
 
@@ -706,5 +1232,24 @@ void gpu_run_gsh(GPU* gpu, ShaderUnit* gsh, bool elements, int basevert,
 }
 
 void gpu_draw(GPU* gpu, bool elements, bool immediate) {
-    gpu_gl_draw(gpu, elements, immediate);
+    DrawSnap snap;
+    if (g_w.on && g_w.skip) {
+        if (!immediate) {
+            g_w.snap_read++;
+            atomic_store_explicit(&g_w.snap_tail, g_w.snap_read,
+                                  memory_order_release);
+        }
+        Vec_free(gpu->immattrs);
+        return;
+    }
+    if (immediate) {
+        // the data came in the command list
+    } else if (g_w.on) {
+        snap = g_w.snaps[g_w.snap_read++ % GW_SNAPS];
+        atomic_store_explicit(&g_w.snap_tail, g_w.snap_read,
+                              memory_order_release);
+    } else {
+        gw_snap_draw(gpu, &gpu->regs, elements, &snap);
+    }
+    gpu_gl_draw(gpu, elements, immediate, &snap);
 }

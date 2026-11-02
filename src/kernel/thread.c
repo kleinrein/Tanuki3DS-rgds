@@ -2,6 +2,11 @@
 
 #include "3ds.h"
 
+#include "kernel/karena.h"
+#define malloc ka_malloc
+#define calloc ka_calloc
+#define free ka_free
+
 void e3ds_restore_context(E3DS* s) {
     if (!CUR_THREAD) return;
     memcpy(s->cpu.r, CUR_THREAD->ctx.r, sizeof s->cpu.r);

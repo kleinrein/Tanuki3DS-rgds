@@ -719,8 +719,9 @@ void optimize_blocklinking(IRBlock* block, ArmCore* cpu) {
                     if (link_pc == block->start_addr &&
                         link_thumb == cpu->cpsr.t) {
                         inst->opcode = IR_END_LOOP;
-                    } else if (link_pc) { // don't link to a null block because
-                                          // apparently this can happen
+                    } else if (link_pc && jit_addr_mapped(link_pc)) {
+                        // don't link to a null block because
+                        // apparently this can happen
                         inst->opcode = IR_END_LINK;
                         inst->op1 = cpu->cpsr.m | (link_thumb << 5);
                         inst->op2 = link_pc;

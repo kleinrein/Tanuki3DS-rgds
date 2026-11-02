@@ -1,3 +1,7 @@
+#define _GNU_SOURCE
+#include <execinfo.h>
+#include <pthread.h>
+#include <ucontext.h>
 #include "memory.h"
 
 #ifdef FASTMEM
@@ -12,6 +16,11 @@
 #include "emulator.h"
 
 #include "svc_types.h"
+
+#include "kernel/karena.h"
+#define malloc ka_malloc
+#define calloc ka_calloc
+#define free ka_free
 
 #define PGROUNDDOWN(a) ((a) & ~(PAGE_SIZE - 1))
 #define PGROUNDUP(a) (((a) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
@@ -28,8 +37,24 @@
 
 void sigsegv_handler(int sig, siginfo_t* info, void* ucontext) {
     u8* addr = info->si_addr;
+    // The game's memory read from the renderer's thread: exceptionJmp belongs to the main thread.
+    extern bool gpu_worker_is_this_thread();
+    if (gpu_worker_is_this_thread() &&
+        ((ctremu.system.virtmem <= addr && addr < ctremu.system.virtmem + BITL(32)) ||
+         (ctremu.system.physmem <= addr && addr < ctremu.system.physmem + BITL(32)))) {
+        extern void rgds_crash_note(const char*, void*, void*, void*);
+        rgds_crash_note("renderer read invalid game memory", addr,
+                        (void*) ((ucontext_t*) ucontext)->uc_mcontext.pc, nullptr);
+        fflush(nullptr);
+        _exit(1);
+    }
     if (ctremu.system.virtmem <= addr &&
         addr < ctremu.system.virtmem + BITL(32)) {
+        {
+            extern void rgds_crash_note(const char*, void*, void*, void*);
+            rgds_crash_note("guest memory access", (void*) (addr - ctremu.system.virtmem),
+                            (void*) (uintptr_t) ctremu.system.cpu.pc, nullptr);
+        }
         lerror("(FATAL) invalid 3DS virtual memory access at %08x (pc near "
                "%08x, thread %d)",
                addr - ctremu.system.virtmem, ctremu.system.cpu.pc,
@@ -43,6 +68,23 @@ void sigsegv_handler(int sig, siginfo_t* info, void* ucontext) {
                addr - ctremu.system.physmem);
         longjmp(ctremu.exceptionJmp, EXC_MEM);
     }
+#if defined(__aarch64__) && defined(__linux__)
+    {
+        ucontext_t* uc = ucontext;
+        extern void rgds_crash_note(const char*, void*, void*, void*);
+        rgds_crash_note("segfault", info->si_addr, (void*) uc->uc_mcontext.pc,
+                        (void*) uc->uc_mcontext.regs[30]);
+        char comm[32] = "";
+        pthread_getname_np(pthread_self(), comm, sizeof comm);
+        fprintf(stderr, "spike segv thread %s addr %p pc %p lr %p x27 %p x28 %p x29 %p\n", comm,
+                info->si_addr, (void*) uc->uc_mcontext.pc, (void*) uc->uc_mcontext.regs[30],
+                (void*) uc->uc_mcontext.regs[27], (void*) uc->uc_mcontext.regs[28],
+                (void*) uc->uc_mcontext.regs[29]);
+        void* frames[24];
+        backtrace_symbols_fd(frames, backtrace(frames, 24), 2);
+        fflush(stderr);
+    }
+#endif
     sigaction(sig, &(struct sigaction) {.sa_handler = SIG_DFL}, nullptr);
 }
 #endif

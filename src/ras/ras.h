@@ -54,6 +54,10 @@ typedef void (*rasErrorCallback)(rasError, void*);
 void rasSetErrorCallback(rasErrorCallback cb, void* userdata);
 
 rasBlock* rasCreate(size_t initialSize, int flags);
+rasBlock* rasCreateInArena(size_t initialSize);
+void rasSeal(rasBlock* ctx);
+size_t rasArenaUsed();
+void rasArenaReset();
 void rasDestroy(rasBlock* ctx);
 
 void rasReady(rasBlock* ctx);

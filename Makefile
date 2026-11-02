@@ -42,6 +42,10 @@ else
 	LIBS += -lcapstone
 endif
 
+# save states keep function pointers and the static machine struct as they are
+CFLAGS_RELEASE += -fno-pie -no-pie
+LIBS += -l:libzstd.a -l:libstdc++.a
+
 ifeq ($(GPROF), 1)
 	CFLAGS += -g -pg
 endif

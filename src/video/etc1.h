@@ -41,4 +41,9 @@ void etc1a4_decompress_texture(u32 width, u32 height,
                                u64 (*src)[width / 8][2][2][2],
                                u8 (*dst)[width][4]);
 
+u64 etc1_block_flip_y(u64 block, bool* clamped);
+bool etc1_block_is_plain(u64 block);
+bool etc1_to_gpu(u32 width, u32 height, const u64* src, int blockstep, u64* dst,
+                 int* clamped);
+
 #endif

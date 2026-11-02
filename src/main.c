@@ -1,7 +1,13 @@
 #include <SDL3/SDL.h>
+#include "rgds_bridge.h"
+#include <dirent.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <SDL3/SDL_main.h>
 #include <getopt.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -39,6 +45,270 @@ void glDebugOutput(GLenum source, GLenum type, unsigned int id, GLenum severity,
     ldebug("[GLDEBUG]%d %d %d %d %s", source, type, id, severity, message);
 }
 #endif
+
+// spike: wall-clock profiler with stacks for the main thread, from SPIKE_PROF_FROM, dumped at quit
+#include <execinfo.h>
+#include <signal.h>
+extern int g_clipped;
+static void spike_crash(int sig) {
+    rgds_crash_note(sig == SIGABRT ? "abort" : "signal", nullptr, nullptr, nullptr);
+    void* frames[32];
+    int n = backtrace(frames, 32);
+    fprintf(stderr, "spike crash signal %d\n", sig);
+    backtrace_symbols_fd(frames, n, 2);
+    FILE* m = fopen("/proc/self/maps", "r");
+    char line[256];
+    while (m && fgets(line, sizeof line, m)) {
+        if (strstr(line, "r-xp")) fputs(line, stderr);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <ucontext.h>
+#define SPIKE_MAX 60000
+static void* spike_stacks[SPIKE_MAX][20];
+static unsigned char spike_depth[SPIKE_MAX];
+static unsigned long spike_x1[SPIKE_MAX];
+static volatile int spike_n = 0;
+static void spike_prof_sig(int sig, siginfo_t* si, void* uc) {
+    int i = spike_n;
+    if (i >= SPIKE_MAX) return;
+    spike_x1[i] = ((ucontext_t*) uc)->uc_mcontext.regs[1];
+    spike_depth[i] = backtrace(spike_stacks[i], 20);
+    spike_n = i + 1;
+}
+static timer_t spike_timer;
+static void spike_prof_start(void) {
+    void* warm[4];
+    backtrace(warm, 4);
+    struct sigaction sa = {.sa_sigaction = spike_prof_sig, .sa_flags = SA_SIGINFO | SA_RESTART};
+    sigaction(SIGPROF, &sa, nullptr);
+    struct sigevent ev = {.sigev_notify = SIGEV_THREAD_ID, .sigev_signo = SIGPROF};
+    ev._sigev_un._tid = syscall(SYS_gettid);
+    timer_create(CLOCK_MONOTONIC, &ev, &spike_timer);
+    long us = getenv("SPIKE_PROF_US") ? atol(getenv("SPIKE_PROF_US")) : 10000;
+    struct itimerspec t = {{0, us * 1000}, {0, us * 1000}};
+    timer_settime(spike_timer, 0, &t, nullptr);
+}
+static void spike_prof_dump(void) {
+    timer_delete(spike_timer);
+    FILE* f = fopen("prof.txt", "w");
+    if (!f) return;
+    FILE* m = fopen("/proc/self/maps", "r");
+    char line[512];
+    while (m && fgets(line, sizeof line, m)) fprintf(f, "map %s", line);
+    if (m) fclose(m);
+    for (int i = 0; i < spike_n; i++) {
+        fprintf(f, "st %lx", spike_x1[i]);
+        for (int j = 0; j < spike_depth[i]; j++) fprintf(f, " %lx", (unsigned long) spike_stacks[i][j]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+// spike: scripted buttons, screenshots and a quit frame, for timed runs on the handheld
+static struct { int frame; char keys[32]; } spike_script[1024];
+static int spike_lines = -1, spike_at = 0, spike_frame = 0;
+static const char* spike_keys(void) {
+    if (spike_lines < 0) {
+        spike_lines = 0;
+        const char* path = getenv("SPIKE_INPUT");
+        FILE* f = path ? fopen(path, "r") : nullptr;
+        if (f) {
+            while (spike_lines < 1024 &&
+                   fscanf(f, "%d %31s", &spike_script[spike_lines].frame,
+                          spike_script[spike_lines].keys) == 2)
+                spike_lines++;
+            fclose(f);
+        }
+    }
+    while (spike_at < spike_lines && spike_script[spike_at].frame <= spike_frame) spike_at++;
+    spike_frame++;
+    return spike_at ? spike_script[spike_at - 1].keys : "-";
+}
+static int spike_slow_frames;
+// only samples from long gaps between presents stay in the worker's profile
+void spike_gap_hook(double ms) {
+    static int kept, gap_ms = -1;
+    if (gap_ms < 0) gap_ms = getenv("SPIKE_GAPPROF") ? atoi(getenv("SPIKE_GAPPROF")) : 0;
+    if (!gap_ms) return;
+    if (ms >= gap_ms) {
+        spike_x1[spike_n < SPIKE_MAX ? spike_n : SPIKE_MAX - 1] = (unsigned long) ms;
+        fprintf(stderr, "spike gap %.0f ms, %d samples\n", ms, spike_n - kept);
+        kept = spike_n;
+    } else {
+        spike_n = kept;
+    }
+}
+static Uint64 spike_win_main;
+static int spike_win_audio = 1 << 30, spike_win_empty;
+static const char* spike_tag = "";
+static bool spike_noquit;
+static SDL_Window* g_window2;
+static void spike_frame_done(int w, int h) {
+    const char* every = getenv("SPIKE_SHOT_EVERY");
+    const char* dir = getenv("SPIKE_SHOTS");
+    const char* quit = getenv("SPIKE_QUIT_AT");
+    // both panels of one present land in the same pair of files
+    static int shot_frame;
+    if (!spike_noquit && *spike_tag) {
+        // second panel: keep the frame the first one saw
+    } else {
+        shot_frame = spike_frame;
+    }
+    if (every && dir && shot_frame % atoi(every) == 0) {
+        char name[512];
+        snprintf(name, sizeof name, "%s/%d%s.bmp", dir, shot_frame, spike_tag);
+        FILE* f = fopen(name, "wb");
+        u8* px = malloc(w * h * 4);
+        if (f && px) {
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            for (int i = 0; i < w * h; i++) {
+                u8 t = px[i * 4];
+                px[i * 4] = px[i * 4 + 2];
+                px[i * 4 + 2] = t;
+            }
+            u32 size = 54 + w * h * 4;
+            u8 hdr[54] = {'B', 'M'};
+            memcpy(hdr + 2, &size, 4);
+            hdr[10] = 54;
+            hdr[14] = 40;
+            memcpy(hdr + 18, &w, 4);
+            memcpy(hdr + 22, &h, 4);
+            hdr[26] = 1;
+            hdr[28] = 32;
+            fwrite(hdr, 1, 54, f);
+            fwrite(px, 1, w * h * 4, f);
+        }
+        if (f) fclose(f);
+        free(px);
+    }
+    if (spike_noquit) return;
+    const char* from = getenv("SPIKE_PROF_FROM");
+    if (from && spike_frame >= atoi(from) && !getenv("SPIKE_PROF_MAIN")) {
+        static bool started;
+        if (!started) spike_prof_start();
+        started = true;
+    }
+    if (quit && spike_frame >= atoi(quit)) {
+        spike_prof_dump();
+        fflush(stdout);
+        _exit(0);
+    }
+}
+
+extern u64 g_jit_ns, g_jit_max;
+extern int g_jit_blocks, g_jit_roots;
+extern u64 g_jit_pre_ns;
+extern int g_jit_pre_roots, g_jit_pre_blocks;
+size_t rasArenaUsed();
+void jit_list_start(const char* rom);
+void jit_list_step(ArmCore* cpu, u64 budget_ns);
+extern int gpu_worker_lost();
+static SDL_GLContext g_glctx;
+// spike: per present, for each panel in turn: drawing it, its swap
+static Uint64 g_present_ns[2][2];
+static int g_present_n;
+static void worker_bind(bool on);
+static void worker_present(int w, int h);
+
+void rgds_worker_restart() {
+    gpu_worker_start(&ctremu.system.gpu, worker_bind, worker_present);
+}
+
+void rgds_audio_hold(bool hold) {
+    if (!g_audio) return;
+    if (hold) SDL_PauseAudioStreamDevice(g_audio);
+    else {
+        SDL_ClearAudioStream(g_audio);
+        SDL_ResumeAudioStreamDevice(g_audio);
+    }
+}
+static SDL_GLContext g_helperctx;
+
+static int list_tasks(int* out, int max) {
+    int n = 0;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return 0;
+    for (struct dirent* e; (e = readdir(d)) && n < max;) {
+        if (e->d_name[0] != '.') out[n++] = atoi(e->d_name);
+    }
+    closedir(d);
+    return n;
+}
+
+// a context with glthread brings its own thread, which does the real work
+static void place_new_threads(const int* before, int nbefore, int cpu, int nice) {
+    int now[256];
+    int n = list_tasks(now, 256);
+    for (int i = 0; i < n; i++) {
+        bool old = false;
+        for (int j = 0; j < nbefore; j++) old |= before[j] == now[i];
+        if (old) continue;
+        char path[64], comm[32] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%d/comm", now[i]);
+        FILE* f = fopen(path, "r");
+        if (f) {
+            fgets(comm, sizeof comm, f);
+            fclose(f);
+        }
+        if (strncmp(comm, "ctremu:gl", 9)) continue;
+        if (getenv("SPIKE_PIN")) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpu, &set);
+            sched_setaffinity(now[i], sizeof set, &set);
+        }
+        if (nice) setpriority(PRIO_PROCESS, now[i], nice);
+    }
+}
+static void helper_bind() {
+    if (!SDL_GL_MakeCurrent(nullptr, g_helperctx)) {
+        fprintf(stderr, "spike helper context: %s\n", SDL_GetError());
+    }
+}
+static void worker_bind(bool on) {
+    SDL_GL_MakeCurrent(g_window, on ? g_glctx : nullptr);
+}
+static void worker_present(int w, int h) {
+    if (g_window2) {
+        // one 3DS screen per panel: the top one 1.6x, the bottom one 2x, unless
+        // the game's Graphics page says otherwise
+        renderer_gl_set_filter(&ctremu.system.gpu.gl, rgds_bridge_filter());
+        static int order = -1;
+        if (order < 0) order = getenv("SPIKE_SWAP_BT") ? 1 : 0;
+        for (int step = 0; step < 2; step++) {
+            int panel = step ^ order;
+            SDL_Window* window = panel ? g_window2 : g_window;
+            Uint64 t0 = SDL_GetTicksNS();
+            if (step) SDL_GL_MakeCurrent(window, g_glctx);
+            else if (panel) SDL_GL_MakeCurrent(window, g_glctx);
+            rgds_bridge_layout(panel, &ctremu.screens[SCREEN_TOP], &ctremu.screens[SCREEN_BOT]);
+            render_gl_main(&ctremu.system.gpu.gl);
+            rgds_bridge_panel(panel);
+            spike_tag = panel ? "b" : "t";
+            spike_noquit = !step;
+            if (!ctremu.pause) spike_frame_done(w, h);
+            glFlush();
+            Uint64 t1 = SDL_GetTicksNS();
+            SDL_GL_SwapWindow(window);
+            Uint64 t2 = SDL_GetTicksNS();
+            g_present_ns[step][0] += t1 - t0;
+            g_present_ns[step][1] += t2 - t1;
+        }
+        g_present_n++;
+        SDL_GL_MakeCurrent(g_window, g_glctx);
+        return;
+    }
+    render_gl_main(&ctremu.system.gpu.gl);
+    if (!ctremu.pause) spike_frame_done(w, h);
+    SDL_GL_SwapWindow(g_window);
+}
 
 void read_args(int argc, char** argv) {
     char c;
@@ -103,6 +373,136 @@ void hotkey_press(SDL_Keycode key) {
         default:
             break;
     }
+}
+
+// spike: the RG DS's own buttons (RG DS OS device tree: BTN_EAST is A).
+// Select + Start held for a second quits, Home quits at once.
+#include <dirent.h>
+#include <fcntl.h>
+#include <linux/input.h>
+static int spike_open_input(const char* want) {
+    DIR* d = opendir("/dev/input");
+    if (!d) return -1;
+    int found = -1;
+    for (struct dirent* e; found < 0 && (e = readdir(d));) {
+        if (strncmp(e->d_name, "event", 5)) continue;
+        char path[300], name[128] = {};
+        snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        ioctl(fd, EVIOCGNAME(sizeof name - 1), name);
+        if (!strcmp(name, want)) found = fd;
+        else close(fd);
+    }
+    closedir(d);
+    return found;
+}
+// the bottom panel's touchscreen sits on i2c-5 (fe5e0000), as in the OS session script
+static bool spike_touch(int* tx, int* ty) {
+    static int fd = -2;
+    static bool down;
+    static int x, y;
+    static struct input_absinfo ix, iy;
+    if (fd == -2) {
+        fd = -1;
+        for (int i = 0; i < 16 && fd < 0; i++) {
+            char link[64], real[300];
+            snprintf(link, sizeof link, "/sys/class/input/event%d/device", i);
+            if (!realpath(link, real) || !strstr(real, "fe5e0000.i2c")) continue;
+            snprintf(link, sizeof link, "/dev/input/event%d", i);
+            fd = open(link, O_RDONLY | O_NONBLOCK);
+        }
+        if (fd >= 0) {
+            ioctl(fd, EVIOCGABS(ABS_X), &ix);
+            ioctl(fd, EVIOCGABS(ABS_Y), &iy);
+        }
+        fprintf(stderr, "spike touch fd %d x %d..%d y %d..%d\n", fd, ix.minimum, ix.maximum,
+                iy.minimum, iy.maximum);
+    }
+    struct input_event ev;
+    while (fd >= 0 && read(fd, &ev, sizeof ev) == sizeof ev) {
+        if (ev.type == EV_KEY && ev.code == BTN_TOUCH) down = ev.value;
+        if (ev.type == EV_ABS && ev.code == ABS_X) x = ev.value;
+        if (ev.type == EV_ABS && ev.code == ABS_Y) y = ev.value;
+    }
+    if (!down || ix.maximum <= ix.minimum || iy.maximum <= iy.minimum) return false;
+    *tx = (x - ix.minimum) * (SCREEN_WIDTH_BOT - 1) / (ix.maximum - ix.minimum);
+    *ty = (y - iy.minimum) * (SCREEN_HEIGHT - 1) / (iy.maximum - iy.minimum);
+    return true;
+}
+
+static void spike_evdev(PadState* btn, int* cx, int* cy) {
+    static int pad = -2, home = -1, held, quit_frames;
+    static u32 keys;
+    static int ax, ay, hx, hy;
+    static struct input_absinfo ix, iy;
+    if (pad == -2) {
+        pad = spike_open_input("retrogame_joypad");
+        home = spike_open_input("adc-keys-home");
+        if (pad >= 0) {
+            ioctl(pad, EVIOCGABS(ABS_X), &ix);
+            ioctl(pad, EVIOCGABS(ABS_Y), &iy);
+        }
+        fprintf(stderr, "spike pad fd %d home fd %d\n", pad, home);
+    }
+    struct input_event ev;
+    while (pad >= 0 && read(pad, &ev, sizeof ev) == sizeof ev) {
+        if (ev.type == EV_KEY) {
+            int bit = -1;
+            switch (ev.code) {
+                case BTN_EAST: bit = 0; break;
+                case BTN_SOUTH: bit = 1; break;
+                case BTN_NORTH: bit = 2; break;
+                case BTN_WEST: bit = 3; break;
+                case BTN_TL: bit = 4; break;
+                case BTN_TR: bit = 5; break;
+                case BTN_SELECT: bit = 6; break;
+                case BTN_START: bit = 7; break;
+                case BTN_DPAD_UP: bit = 8; break;
+                case BTN_DPAD_DOWN: bit = 9; break;
+                case BTN_DPAD_LEFT: bit = 10; break;
+                case BTN_DPAD_RIGHT: bit = 11; break;
+            }
+            if (bit >= 0) keys = ev.value ? keys | BIT(bit) : keys & ~BIT(bit);
+        } else if (ev.type == EV_ABS) {
+            if (ev.code == ABS_X) ax = ev.value;
+            if (ev.code == ABS_Y) ay = ev.value;
+            if (ev.code == ABS_HAT0X) hx = ev.value;
+            if (ev.code == ABS_HAT0Y) hy = ev.value;
+        }
+    }
+    while (home >= 0 && read(home, &ev, sizeof ev) == sizeof ev) {
+        // with the shared menu Home is the launcher's
+        if (ev.type == EV_KEY && ev.value && !rgds_bridge_on()) ctremu.running = false;
+    }
+    btn->a |= keys >> 0 & 1;
+    btn->b |= keys >> 1 & 1;
+    btn->x |= keys >> 2 & 1;
+    btn->y |= keys >> 3 & 1;
+    btn->l |= keys >> 4 & 1;
+    btn->r |= keys >> 5 & 1;
+    btn->select |= keys >> 6 & 1;
+    btn->start |= keys >> 7 & 1;
+    btn->up |= (keys >> 8 & 1) | (hy < 0);
+    btn->down |= (keys >> 9 & 1) | (hy > 0);
+    btn->left |= (keys >> 10 & 1) | (hx < 0);
+    btn->right |= (keys >> 11 & 1) | (hx > 0);
+    if (ix.maximum > ix.minimum) {
+        float x = (ax - (ix.minimum + ix.maximum) / 2.f) / ((ix.maximum - ix.minimum) / 2.f);
+        if (x > -0.2f && x < 0.2f) x = 0;
+        if (abs((int) (x * INT16_MAX)) > abs(*cx)) *cx = x * INT16_MAX;
+    }
+    if (iy.maximum > iy.minimum) {
+        float y = (ay - (iy.minimum + iy.maximum) / 2.f) / ((iy.maximum - iy.minimum) / 2.f);
+        if (y > -0.2f && y < 0.2f) y = 0;
+        if (abs((int) (y * INT16_MAX)) > abs(*cy)) *cy = -y * INT16_MAX;
+    }
+    if (btn->select && btn->start) {
+        if (++quit_frames > 60 && !rgds_bridge_on()) ctremu.running = false;
+    } else {
+        quit_frames = 0;
+    }
+    (void) held;
 }
 
 void update_input() {
@@ -189,7 +589,8 @@ void update_input() {
         renderer_gl_update_freecam(&ctremu.system.gpu.gl);
     }
 
-    if (g_gamepad) {
+    // on the handheld its own pad is read directly: SDL's guess at it also made R2 an R
+    if (g_gamepad && !rgds_bridge_on()) {
         btn.a |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_EAST);
         btn.b |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_SOUTH);
         btn.x |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_NORTH);
@@ -226,6 +627,27 @@ void update_input() {
         if (ry < -INT16_MAX / 2) btn.up = 1;
     }
 
+    {
+        char keys[32];
+        strcpy(keys, spike_keys());
+        for (char* k = strtok(keys, "+"); k; k = strtok(nullptr, "+")) {
+            if (!strcmp(k, "A")) btn.a = 1;
+            if (!strcmp(k, "B")) btn.b = 1;
+            if (!strcmp(k, "X")) btn.x = 1;
+            if (!strcmp(k, "Y")) btn.y = 1;
+            if (!strcmp(k, "L")) btn.l = 1;
+            if (!strcmp(k, "R")) btn.r = 1;
+            if (!strcmp(k, "START")) btn.start = 1;
+            if (!strcmp(k, "SELECT")) btn.select = 1;
+            if (!strcmp(k, "LEFT")) btn.left = 1;
+            if (!strcmp(k, "RIGHT")) btn.right = 1;
+            if (!strcmp(k, "UP")) btn.up = 1;
+            if (!strcmp(k, "DOWN")) btn.down = 1;
+        }
+    }
+
+    spike_evdev(&btn, &cx, &cy);
+
     btn.cup = cy > INT16_MAX / 2;
     btn.cdown = cy < INT16_MIN / 2;
     btn.cleft = cx < INT16_MIN / 2;
@@ -241,6 +663,7 @@ void update_input() {
         }
     }
     int tx = xf, ty = yf;
+    if (g_window2) pressed = false; // read from the panel itself below
 
     if (pressed) {
         tx -= ctremu.screens[SCREEN_BOT].x;
@@ -256,6 +679,8 @@ void update_input() {
         tx = 0;
         ty = 0;
     }
+
+    if (g_window2) pressed = spike_touch(&tx, &ty);
 
     float accel[3] = {};
     float gyro[3] = {};
@@ -369,7 +794,31 @@ void update_cam() {
     SDL_ReleaseCameraFrame(g_camera, image);
 }
 
+static volatile Uint64 spike_post_gap;
+static void SDLCALL spike_postmix(void* user, const SDL_AudioSpec* spec, float* buffer, int buflen) {
+    static FILE* f;
+    static int tried;
+    static Uint64 last;
+    (void) user; (void) spec;
+    if (!tried) {
+        tried = 1;
+        if (getenv("SPIKE_POSTMIX")) f = fopen(getenv("SPIKE_POSTMIX"), "wb");
+    }
+    if (f) fwrite(buffer, 1, buflen, f);
+    Uint64 now = SDL_GetTicksNS();
+    if (last && now - last > spike_post_gap) spike_post_gap = now - last;
+    last = now;
+}
+
+// spike: a recording of what the DSP hands over, to tell its own clicks from playback's
 void audio_callback(s16 (*samples)[2], u32 count) {
+    static FILE* wav;
+    static int wav_tried;
+    if (!wav_tried) {
+        wav_tried = 1;
+        if (getenv("SPIKE_WAV")) wav = fopen(getenv("SPIKE_WAV"), "wb");
+    }
+    if (wav) fwrite(samples, 4, count, wav);
     if (ctremu.fastforward || ctremu.mute) return;
     SDL_PutAudioStreamData(g_audio, samples, count * 2 * sizeof(s16));
 }
@@ -377,7 +826,11 @@ void audio_callback(s16 (*samples)[2], u32 count) {
 int main(int argc, char** argv) {
     SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "Tanuki3DS");
 
+    signal(SIGSEGV, spike_crash);
+    signal(SIGBUS, spike_crash);
+    signal(SIGABRT, spike_crash);
     read_args(argc, argv);
+    rgds_bridge_start();
 
     const char* basepath = SDL_GetBasePath();
 
@@ -413,12 +866,43 @@ int main(int argc, char** argv) {
 #ifdef GLDEBUGCTX
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
 #endif
-    g_window = SDL_CreateWindow("Tanuki3DS", ctremu.windowW, ctremu.windowH,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-    SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED,
-                          SDL_WINDOWPOS_CENTERED);
+    int ndisplays = 0;
+    SDL_DisplayID* displays = SDL_GetDisplays(&ndisplays);
+    for (int i = 0; i < ndisplays; i++) {
+        fprintf(stderr, "spike display %d: %s\n", i, SDL_GetDisplayName(displays[i]));
+    }
+    if (getenv("SPIKE_PANELS") && ndisplays >= 2) {
+        // RG DS OS: DSI-2 is the top panel (SDL_KMSDRM_FIRST in its session script)
+        int top = getenv("SPIKE_TOP_DISPLAY") ? atoi(getenv("SPIKE_TOP_DISPLAY")) : 1;
+        for (int i = 0; i < 2; i++) {
+            SDL_PropertiesID p = SDL_CreateProperties();
+            SDL_DisplayID d = displays[i == 0 ? top : !top];
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_X_NUMBER,
+                                  SDL_WINDOWPOS_UNDEFINED_DISPLAY(d));
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_Y_NUMBER,
+                                  SDL_WINDOWPOS_UNDEFINED_DISPLAY(d));
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, 640);
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, 480);
+            SDL_SetBooleanProperty(p, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true);
+            SDL_SetBooleanProperty(p, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, true);
+            SDL_Window* w = SDL_CreateWindowWithProperties(p);
+            SDL_DestroyProperties(p);
+            if (i == 0) g_window = w;
+            else g_window2 = w;
+            fprintf(stderr, "spike window %d on display %u: %p\n", i, d, (void*) w);
+        }
+    } else {
+        g_window = SDL_CreateWindow("Tanuki3DS", ctremu.windowW, ctremu.windowH,
+                                    SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+        SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED,
+                              SDL_WINDOWPOS_CENTERED);
+    }
 
+    int tasks[256];
+    int ntasks = list_tasks(tasks, 256);
     SDL_GLContext glcontext = SDL_GL_CreateContext(g_window);
+    place_new_threads(tasks, ntasks, 0, 0);
+    g_glctx = glcontext;
     if (!glcontext) {
         SDL_Quit();
         lerror("could not create gl context");
@@ -426,6 +910,18 @@ int main(int argc, char** argv) {
     }
 
     gladLoadGLLoader((void*) SDL_GL_GetProcAddress);
+
+    if (getenv("SPIKE_NOGUI") && !getenv("SPIKE_NOASYNC")) {
+        extern void (*gpu_gl_helper_bind)(void);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+        ntasks = list_tasks(tasks, 256);
+        g_helperctx = SDL_GL_CreateContext(g_window);
+        place_new_threads(tasks, ntasks, 1, 5);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+        SDL_GL_MakeCurrent(g_window, glcontext);
+        if (g_helperctx) gpu_gl_helper_bind = helper_bind;
+        else fprintf(stderr, "spike no helper context: %s\n", SDL_GetError());
+    }
 
 #ifdef GLDEBUGCTX
     glEnable(GL_DEBUG_OUTPUT);
@@ -449,11 +945,31 @@ int main(int argc, char** argv) {
         .channels = 2,
         .freq = SAMPLE_RATE,
     };
-    g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &as,
-                                        nullptr, nullptr);
+    if (getenv("SPIKE_NOGUI")) {
+        // spike: the handheld's mixer runs at 48 kHz. Opened any other way the sound gets a second, cruder
+        // resampling in ALSA's plug on the way there.
+        SDL_AudioSpec devspec = {.format = SDL_AUDIO_S16, .channels = 2, .freq = 48000};
+        SDL_AudioDeviceID dev = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &devspec);
+        g_audio = SDL_CreateAudioStream(&as, &devspec);
+        SDL_BindAudioStream(dev, g_audio);
+    } else {
+        g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &as,
+                                            nullptr, nullptr);
+    }
 
     SDL_ResumeAudioStreamDevice(g_audio);
     ctremu.audio_cb = audio_callback;
+    {
+        // spike: what the device really gets, and how evenly
+        SDL_AudioSpec dev;
+        int frames = 0;
+        SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(g_audio), &dev, &frames);
+        fprintf(stderr, "spike audio device %d Hz %d ch fmt %x, %d frames\n", dev.freq, dev.channels,
+                dev.format, frames);
+        SDL_SetAudioPostmixCallback(SDL_GetAudioStreamDevice(g_audio), spike_postmix, nullptr);
+    }
+    fprintf(stderr, "spike audio driver %s device %s stream %p\n", SDL_GetCurrentAudioDriver(),
+            SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(g_audio)), (void*) g_audio);
 
     ImGui_CreateContext(nullptr);
     ImGui_GetIO()->ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -479,6 +995,17 @@ int main(int argc, char** argv) {
 
         int exc;
         if ((exc = setjmp(ctremu.exceptionJmp))) {
+            // on the handheld there is no window to say it in and nothing to reset into: back home
+            if (rgds_bridge_on()) {
+                const char* why = exc == EXC_EXIT    ? "the game exited"
+                                  : exc == EXC_MEM   ? "invalid memory access"
+                                  : exc == EXC_ERRF  ? "the game reported a fatal error"
+                                  : "the game terminated";
+                rgds_crash_note(why, nullptr, (void*) (uintptr_t) ctremu.system.cpu.pc, nullptr);
+                fprintf(stderr, "rgds bridge: %s, returning home\n", why);
+                fflush(nullptr);
+                _exit(exc == EXC_EXIT ? 0 : 1);
+            }
             emulator_set_rom(nullptr);
             static const char* errmess[] = {
                 [EXC_MEM] = "Invalid memory access.",
@@ -494,6 +1021,7 @@ int main(int argc, char** argv) {
             ctremu.pending_reset = false;
             if (emulator_reset()) {
                 ctremu.pause = false;
+                rgds_bridge_autoload();
                 uistate.menubar = !ctremu.initialized;
             } else {
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Tanuki3DS",
@@ -546,30 +1074,77 @@ int main(int argc, char** argv) {
         if (!ctremu.initialized) ctremu.pause = true;
 
         SDL_GetWindowSizeInPixels(g_window, &ctremu.windowW, &ctremu.windowH);
-        emulator_calc_viewports();
+        // the worker sets the rectangles itself on two panels
+        if (!g_window2) emulator_calc_viewports();
 
-        if (!ctremu.pause) {
+        // spike: the worker owns the gl context, so only without the imgui pass
+        if (ctremu.initialized && !gpu_worker_on() && getenv("SPIKE_NOGUI") &&
+            !getenv("SPIKE_NOWORKER")) {
+            gpu_worker_start(&ctremu.system.gpu, worker_bind, worker_present);
+            if (getenv("SPIKE_PIN")) {
+                // the emulation core, as RG DS Core's session script keeps CPU 3 for it
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(3, &set);
+                pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+            }
+        }
+
+        if (getenv("SPIKE_PROF_MAIN") && getenv("SPIKE_PROF_FROM") &&
+            spike_frame == atoi(getenv("SPIKE_PROF_FROM"))) {
+            spike_prof_start();
+        }
+
+        bool menu_held = rgds_bridge_tick();
+        if (menu_held) gpu_worker_start_frame(&ctremu.system.gpu);
+
+        if (!ctremu.pause && !menu_held) {
             update_input();
             update_mic();
             update_cam();
 
-            gpu_gl_start_frame(&ctremu.system.gpu);
+            gpu_worker_start_frame(&ctremu.system.gpu);
+            if (getenv("SPIKE_DUMP_AT")) {
+                int at = atoi(getenv("SPIKE_DUMP_AT"));
+                g_draw_dump = spike_frame >= at && spike_frame < at + 3;
+            }
 
             Uint64 frame_start = SDL_GetTicksNS();
+            // only samples from inside slow frames stay in the slow-frame profile
+            static int prof_kept;
+            if (getenv("SPIKE_SLOWPROF")) spike_n = prof_kept;
             e3ds_run_frame(&ctremu.system);
             frame++;
             Uint64 frame_time = SDL_GetTicksNS() - frame_start;
+            {
+                static int slow_ms = -1;
+                if (slow_ms < 0) {
+                    slow_ms = getenv("SPIKE_SLOWPROF") ? atoi(getenv("SPIKE_SLOWPROF")) : 0;
+                }
+                if (slow_ms && frame_time >= slow_ms * SDL_NS_PER_MS) {
+                    prof_kept = spike_n;
+                    spike_slow_frames++;
+                }
+                if (frame_time > spike_win_main) spike_win_main = frame_time;
+                int q = SDL_GetAudioStreamQueued(g_audio) / 4;
+                if (q < spike_win_audio) spike_win_audio = q;
+                if (q == 0) spike_win_empty++;
+            }
             avg_frame_time += (double) frame_time / SDL_NS_PER_MS;
             avg_frame_time_ct++;
-
-            render_gl_main(&ctremu.system.gpu.gl);
         }
-        if (ctremu.initialized) {
+        if (gpu_worker_on()) {
+            // presented on the worker
+        } else if (ctremu.initialized) {
             render_gl_main(&ctremu.system.gpu.gl);
         } else {
             glClear(GL_COLOR_BUFFER_BIT);
         }
 
+        // spike: no menus on the handheld, so no UI pass
+        static int nogui = -1;
+        if (nogui < 0) nogui = getenv("SPIKE_NOGUI") != nullptr;
+        if (!nogui || !ctremu.initialized) {
         cImGui_ImplOpenGL3_NewFrame();
         cImGui_ImplSDL3_NewFrame();
         ImGui_NewFrame();
@@ -588,8 +1163,14 @@ int main(int argc, char** argv) {
             ImGui_RenderPlatformWindowsDefault();
             SDL_GL_MakeCurrent(g_window, glcontext);
         }
+        }
 
-        SDL_GL_SwapWindow(g_window);
+        if (gpu_worker_on()) {
+            gpu_worker_present(ctremu.windowW, ctremu.windowH);
+        } else {
+            if (!ctremu.pause) spike_frame_done(ctremu.windowW, ctremu.windowH);
+            SDL_GL_SwapWindow(g_window);
+        }
 
         Uint64 elapsed = SDL_GetTicksNS() - prev_fps_update;
         if (!ctremu.pause && elapsed >= SDL_NS_PER_SECOND / 2) {
@@ -603,6 +1184,54 @@ int main(int argc, char** argv) {
                      EMUVERSION, ctremu.system.romimage.name, fps,
                      avg_frame_time / avg_frame_time_ct);
             SDL_SetWindowTitle(g_window, wintitle);
+            fprintf(stderr, "%s\n", wintitle); // spike: fps on stderr
+            if (gpu_worker_on()) {
+                double busy, present, wait;
+                int copies, wraps, n = frame - prev_fps_frame;
+                gpu_worker_stats(&busy, &present, &wait, &copies, &wraps);
+                if (n) {
+                    fprintf(stderr,
+                            "worker: busy %.1f present %.1f, main wait %.1f ms/frame, "
+                            "copies %d wraps %d drawn %d/%d lutmiss %d guest %d "
+                            "draws %d creates %d partial %d behind %.2f audio %d "
+                            "| maxmain %.0f maxgap %.0f minaudio %d empty %d links %d "
+                            "ms: link %.0f compile %.0f tex %.0f clip %d auddev %.0f "
+                            "progwait %.0f progs %d/%d jit %d/%d ms %.1f max %.1f "
+                            "pre %d/%d ms %.1f arena %.1f swaps %.1f+%.1f %.1f+%.1f lost %d\n",
+                            busy / n, present / n, wait / n, copies, wraps,
+                            gpu_worker_drawn(), n, g_lut_misses, gpu_worker_transfers(),
+                            g_draws / (n ? n : 1), g_tex_creates, g_tex_partial,
+                            gpu_worker_behind(), SDL_GetAudioStreamQueued(g_audio) / 4,
+                            spike_win_main / 1e6, gpu_worker_maxgap(), spike_win_audio,
+                            spike_win_empty, g_links, g_ns_shaders / 1e6, g_ns_compile / 1e6,
+                            g_ns_textures / 1e6, g_clipped, spike_post_gap / 1e6,
+                            g_ns_progwait / 1e6, g_prog_ready, g_prog_total,
+                            g_jit_roots, g_jit_blocks, g_jit_ns / 1e6, g_jit_max / 1e6,
+                            g_jit_pre_roots, g_jit_pre_blocks, g_jit_pre_ns / 1e6,
+                            rasArenaUsed() / 1048576.0,
+                            g_present_ns[0][0] / 1e6 / (g_present_n ? g_present_n : 1),
+                            g_present_ns[0][1] / 1e6 / (g_present_n ? g_present_n : 1),
+                            g_present_ns[1][0] / 1e6 / (g_present_n ? g_present_n : 1),
+                            g_present_ns[1][1] / 1e6 / (g_present_n ? g_present_n : 1),
+                            gpu_worker_lost());
+                    memset(g_present_ns, 0, sizeof g_present_ns);
+                    g_present_n = 0;
+                    g_jit_pre_roots = g_jit_pre_blocks = 0;
+                    g_jit_pre_ns = 0;
+                    g_jit_roots = g_jit_blocks = 0;
+                    g_jit_ns = g_jit_max = 0;
+                    g_ns_progwait = 0;
+                    spike_post_gap = 0;
+                    g_ns_shaders = g_ns_compile = g_ns_textures = 0;
+                    g_clipped = 0;
+                    spike_win_main = 0;
+                    spike_win_audio = 1 << 30;
+                    spike_win_empty = 0;
+                    g_links = 0;
+                    g_lut_misses = 0;
+                    g_draws = g_tex_creates = g_tex_partial = 0;
+                }
+            }
             free(wintitle);
             prev_fps_frame = frame;
             avg_frame_time = 0;
@@ -615,7 +1244,7 @@ int main(int argc, char** argv) {
         }
 
         if (ctremu.fastforward && !ctremu.pause) {
-            gpu_gl_start_frame(&ctremu.system.gpu);
+            gpu_worker_start_frame(&ctremu.system.gpu);
             while (SDL_GetTicksNS() - prev_frame_time < frame_ticks) {
                 Uint64 frame_start = SDL_GetTicksNS();
                 e3ds_run_frame(&ctremu.system);
@@ -623,6 +1252,46 @@ int main(int argc, char** argv) {
                 Uint64 frame_time = SDL_GetTicksNS() - frame_start;
                 avg_frame_time += (double) frame_time / SDL_NS_PER_MS;
                 avg_frame_time_ct++;
+            }
+        } else if (gpu_worker_on() && !getenv("SPIKE_AUDIOPACE")) {
+            // spike: pacing on the audio queue hands out frames in the bursts the
+            // device takes samples in. Run on a steady clock, make up for a short
+            // stall by not waiting, and hold the queue with a resampling ratio too
+            // small to hear, so the clock never has to move.
+            static Uint64 next_frame;
+            static float queue_avg = -1;
+            float queued = SDL_GetAudioStreamQueued(g_audio) / 4;
+            if (queue_avg < 0) queue_avg = queued;
+            queue_avg += (queued - queue_avg) * 0.02f;
+            const float target = SAMPLE_RATE * 0.06f;
+            static int ratio_wait;
+            if (++ratio_wait >= 15) {
+                ratio_wait = 0;
+                // down to 3% slow when the game cannot keep 60 for a while: a lower pitch for a
+                // moment is far less audible than the queue running dry
+                float ratio = 1 + (queue_avg - target) / target * 0.04f;
+                if (ratio < 0.97f) ratio = 0.97f;
+                if (ratio > 1.01f) ratio = 1.01f;
+                if (!getenv("SPIKE_NORATIO")) SDL_SetAudioStreamFrequencyRatio(g_audio, ratio);
+            }
+
+            Uint64 now = SDL_GetTicksNS();
+            next_frame += frame_ticks;
+            if (getenv("SPIKE_NOGUI") && ctremu.initialized && !getenv("SPIKE_NOJITLIST")) {
+                static bool listed;
+                if (!listed && ctremu.romfilenoext) {
+                    listed = true;
+                    jit_list_start(ctremu.romfilenoext);
+                }
+                Uint64 tnow = SDL_GetTicksNS();
+                if (next_frame > tnow + 2 * SDL_NS_PER_MS && !rgds_bridge_busy()) {
+                    jit_list_step(&ctremu.system.cpu, next_frame - tnow - 2 * SDL_NS_PER_MS);
+                }
+            }
+            if (next_frame + 100 * SDL_NS_PER_MS < now || next_frame > now + 2 * frame_ticks) {
+                next_frame = now;
+            } else if (next_frame > now) {
+                SDL_DelayPrecise(next_frame - now);
             }
         } else {
             if (ctremu.audiosync && !ctremu.mute && ctremu.initialized &&
@@ -640,6 +1309,20 @@ int main(int argc, char** argv) {
 
         prev_frame_time = SDL_GetTicksNS();
     }
+
+    if (getenv("SPIKE_PROF_FROM")) {
+        fprintf(stderr, "spike slow frames %d\n", spike_slow_frames);
+        spike_prof_dump();
+    }
+    if (gpu_worker_on()) {
+        // spike: tearing down under the renderer thread crashes, and nothing after this matters
+        // but the saves, which are stdio files
+        fflush(nullptr);
+        { extern void gpu_gl_print_texstat(void); gpu_gl_print_texstat(); }
+        fprintf(stderr, "spike clean exit\n");
+        _exit(0);
+    }
+    gpu_worker_stop();
 
     cImGui_ImplOpenGL3_Shutdown();
     cImGui_ImplSDL3_Shutdown();

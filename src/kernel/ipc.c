@@ -1,5 +1,10 @@
 #include "ipc.h"
 
+#include "kernel/karena.h"
+#define malloc ka_malloc
+#define calloc ka_calloc
+#define free ka_free
+
 KSession* session_create(PortRequestHandler f) {
     KSession* session = calloc(1, sizeof *session);
     session->hdr.type = KOT_SESSION;

@@ -82,6 +82,61 @@ char* archive_basepath(E3DS* s, u64 archive) {
     return basepath;
 }
 
+// what a save state needs to open the game's files again
+static char* g_fs_path[FS_FILE_MAX];
+static bool g_fs_rw[FS_FILE_MAX];
+
+void savestate_put(void* ss, const void* p, size_t n);
+bool savestate_get(void* ss, void* p, size_t n);
+
+void fs_files_put(E3DS* s, void* ss) {
+    for (int i = 0; i < FS_FILE_MAX; i++) {
+        FILE* fp = s->services.fs.files[i];
+        s64 pos = -1;
+        if (fp && g_fs_path[i]) {
+            fflush(fp);
+            pos = ftello(fp);
+        }
+        savestate_put(ss, &pos, sizeof pos);
+        if (pos < 0) continue;
+        u32 len = strlen(g_fs_path[i]);
+        savestate_put(ss, &len, sizeof len);
+        savestate_put(ss, g_fs_path[i], len);
+        savestate_put(ss, &g_fs_rw[i], sizeof g_fs_rw[i]);
+    }
+}
+
+void fs_files_close(E3DS* s) {
+    for (int i = 0; i < FS_FILE_MAX; i++) {
+        if (s->services.fs.files[i]) fclose(s->services.fs.files[i]);
+        s->services.fs.files[i] = nullptr;
+        if (s->services.fs.dirs[i]) closedir(s->services.fs.dirs[i]);
+        s->services.fs.dirs[i] = nullptr;
+    }
+}
+
+void fs_files_get(E3DS* s, void* ss) {
+    for (int i = 0; i < FS_FILE_MAX; i++) {
+        s64 pos;
+        if (!savestate_get(ss, &pos, sizeof pos)) return;
+        if (pos < 0) continue;
+        u32 len;
+        if (!savestate_get(ss, &len, sizeof len) || len > 4096) return;
+        free(g_fs_path[i]);
+        g_fs_path[i] = malloc(len + 1);
+        if (!savestate_get(ss, g_fs_path[i], len)) return;
+        g_fs_path[i][len] = 0;
+        if (!savestate_get(ss, &g_fs_rw[i], sizeof g_fs_rw[i])) return;
+        FILE* fp = fopen(g_fs_path[i], g_fs_rw[i] ? "rb+" : "rb");
+        if (!fp) {
+            lwarn("state: could not open %s again", g_fs_path[i]);
+            continue;
+        }
+        fseeko(fp, pos, SEEK_SET);
+        s->services.fs.files[i] = fp;
+    }
+}
+
 FILE* open_formatinfo(E3DS* s, u64 archive, bool write) {
     char* basepath = archive_basepath(s, archive);
     if (!basepath) {
@@ -1069,6 +1124,9 @@ KSession* fs_open_file(E3DS* s, u64 archive, u32 pathtype, void* rawpath,
                 return nullptr;
             }
             s->services.fs.files[fd] = fp;
+            free(g_fs_path[fd]);
+            g_fs_path[fd] = strdup(filepath);
+            g_fs_rw[fd] = (flags & 3) != 0b01;
 
             KSession* ses = session_create_arg(port_handle_fs_file, fd);
             linfo("opened file %s with fd %d", filepath, fd);

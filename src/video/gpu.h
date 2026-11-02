@@ -68,6 +68,13 @@ typedef struct _TexInfo {
     u64 hash;
     bool needs_rehash;
 
+    // spike: what the gl sampler state of this texture was last set from
+    u32 sampler_param, sampler_border, sampler_lod;
+    bool sampler_valid;
+    bool etcnative; // stored as ETC blocks, updates must be too
+    bool stale;     // the game wrote or flushed memory here: compare before rebuilding it
+    u64 content;    // what it was built from
+
     struct _TexInfo *next, *prev;
 
     u32 tex;
@@ -206,6 +213,19 @@ void gpu_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
 void gpu_clear_fb(GPU* gpu, u32 paddr, u32 len, u32 value, u32 datasz);
 
 void gpu_draw(GPU* gpu, bool elements, bool immediate);
+
+// spike: the renderer runs on its own thread, see gpu.c
+bool gpu_worker_on();
+int gpu_worker_drawn();
+int gpu_worker_transfers();
+double gpu_worker_behind();
+double gpu_worker_maxgap();
+void gpu_worker_start(GPU* gpu, void (*bind)(bool), void (*present)(int, int));
+void gpu_worker_stop();
+void gpu_worker_sync(bool finish);
+void gpu_worker_start_frame(GPU* gpu);
+void gpu_worker_present(int w, int h);
+void gpu_worker_stats(double* busy, double* present, double* wait, int* copies, int* wraps);
 
 FBInfo* gpu_fbcache_find_within(GPU* gpu, u32 color_paddr);
 TexInfo* gpu_texcache_find_within(GPU* gpu, u32 paddr);

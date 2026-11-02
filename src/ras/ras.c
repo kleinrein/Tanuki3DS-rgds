@@ -86,6 +86,7 @@ typedef struct _rasBlock {
     size_t size;
 
     size_t initialSize;
+    bool inarena;
     int flags;
 
     LISTNODE(rasSymbol) symbols;
@@ -131,6 +132,48 @@ static void* jit_alloc(size_t size) {
     return ptr;
 }
 
+// Every block used to get its own mapping: a syscall and a page fault to
+// compile it, cache maintenance over all of it, and code spread over a page per
+// block. Now blocks sit side by side in one mapping; the space of an invalidated
+// block is not reused (that is rare), and past the end they fall back to mmap.
+#define RAS_ARENA_SIZE (256u << 20)
+#define RAS_ARENA_ALIGN (2u << 20)
+static u8* ras_arena;
+static u8* ras_arena_cur;
+static u8* ras_arena_end;
+
+void rasArenaReset() {
+    ras_arena_cur = ras_arena;
+}
+
+size_t rasArenaUsed() {
+    return ras_arena_cur - ras_arena;
+}
+
+static void* arena_alloc(size_t size) {
+#if defined(__linux__)
+    if (!ras_arena) {
+        u8* p = mmap(rasErrorStrings, RAS_ARENA_SIZE + RAS_ARENA_ALIGN,
+                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        if (p == MAP_FAILED) {
+            ras_arena = (u8*) 1;
+            ras_arena_cur = ras_arena_end = ras_arena;
+            return NULL;
+        }
+        ras_arena = (u8*) (((uintptr_t) p + RAS_ARENA_ALIGN - 1) &
+                           ~(uintptr_t) (RAS_ARENA_ALIGN - 1));
+        ras_arena_cur = ras_arena;
+        ras_arena_end = ras_arena + RAS_ARENA_SIZE;
+        madvise(ras_arena, RAS_ARENA_SIZE, MADV_HUGEPAGE);
+    }
+    if ((size_t) (ras_arena_end - ras_arena_cur) < size) return NULL;
+    return ras_arena_cur;
+#else
+    return NULL;
+#endif
+}
+
 static void jit_free(void* code, size_t size) {
 #ifdef _WIN32
     VirtualFree(code, 0, MEM_RELEASE);
@@ -159,8 +202,28 @@ rasBlock* rasCreate(size_t initialSize, int flags) {
     return ctx;
 }
 
+// for one thread only, which must rasSeal a block before it starts the next
+rasBlock* rasCreateInArena(size_t initialSize) {
+    void* code = arena_alloc(initialSize);
+    if (!code) return rasCreate(initialSize, 0);
+    rasBlock* ctx = calloc(1, sizeof *ctx);
+    ctx->code = code;
+    ctx->inarena = true;
+    ctx->curr = ctx->code;
+    ctx->size = initialSize;
+    ctx->initialSize = initialSize;
+    return ctx;
+}
+
+// the block's code is complete: the next one may start right after it
+void rasSeal(rasBlock* ctx) {
+    if (!ctx->inarena) return;
+    ctx->size = ctx->curr - ctx->code;
+    ras_arena_cur = (u8*) (((uintptr_t) ctx->curr + 15) & ~(uintptr_t) 15);
+}
+
 void rasDestroy(rasBlock* ctx) {
-    jit_free(ctx->code, ctx->size);
+    if (!ctx->inarena) jit_free(ctx->code, ctx->size);
 
     free(ctx);
 }
@@ -279,7 +342,8 @@ void rasReady(rasBlock* ctx) {
     pthread_jit_write_protect_np(1);
 #endif
 #ifdef __aarch64__
-    __builtin___clear_cache(ctx->code, ctx->code + ctx->size);
+    __builtin___clear_cache(ctx->code, ctx->inarena ? ctx->code + ctx->size
+                                                    : ctx->curr);
 #endif
 }
 

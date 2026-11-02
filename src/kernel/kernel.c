@@ -2,6 +2,11 @@
 
 #include "3ds.h"
 
+#include "kernel/karena.h"
+#define malloc ka_malloc
+#define calloc ka_calloc
+#define free ka_free
+
 u32 handle_new(E3DS* s) {
     for (int i = 0; i < HANDLE_MAX; i++) {
         if (!s->process.handles[i]) {

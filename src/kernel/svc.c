@@ -9,6 +9,11 @@
 #include "svc_types.h"
 #include "thread.h"
 
+#include "kernel/karena.h"
+#define malloc ka_malloc
+#define calloc ka_calloc
+#define free ka_free
+
 #define R(n) caller->ctx.r[n]
 
 #define MAKE_HANDLE(handle)                                                    \

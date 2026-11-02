@@ -1,3 +1,4 @@
+int g_clipped;
 #include "dsp.h"
 
 #include "emulator.h"
@@ -391,6 +392,17 @@ dsp_ch_end:
     stat->cur_buf_dirty = stat->cur_buf != og_cur_buf;
 }
 
+// spike: a limiter instead of a hard clamp: peaks above the knee bend, so a raised volume does not crackle
+static s16 soft_limit(float in) {
+    const float knee = 24000.f, room = 32767.f - knee;
+    float mag = in < 0 ? -in : in;
+    if (mag <= knee) return in;
+    g_clipped++;
+    float over = (mag - knee) / room;
+    mag = knee + room * (over / (1.f + over));
+    return in < 0 ? -mag : mag;
+}
+
 s16 clamp16(s32 in) {
     if (in > INT16_MAX) return INT16_MAX;
     if (in < INT16_MIN) return INT16_MIN;
@@ -422,8 +434,8 @@ void dsp_process_frame(DSP* dsp) {
 
     s16 final[FRAME_SAMPLES][2];
     for (int s = 0; s < FRAME_SAMPLES; s++) {
-        final[s][0] = clamp16(mixer[s][0] * (ctremu.volume / 100.f));
-        final[s][1] = clamp16(mixer[s][1] * (ctremu.volume / 100.f));
+        final[s][0] = soft_limit(mixer[s][0] * (ctremu.volume / 100.f));
+        final[s][1] = soft_limit(mixer[s][1] * (ctremu.volume / 100.f));
     }
 
     if (ctremu.audio_cb) ctremu.audio_cb(final, FRAME_SAMPLES);
