@@ -74,6 +74,12 @@ typedef struct _TexInfo {
     bool etcnative; // stored as ETC blocks, updates must be too
     bool stale;     // the game wrote or flushed memory here: compare before rebuilding it
     u64 content;    // what it was built from
+    // spike: the bytes an ETC texture was last built from, so a change is uploaded tile by tile
+    // (NSMB2 rebuilt a 1-megapixel ETC1A4 atlas 10-16 times a half second, 23 ms each);
+    // dirty_lo..dirty_hi is where the game wrote since, as offsets into the texture
+    u8* shadow;
+    u32 shadow_size;
+    u32 dirty_lo, dirty_hi;
 
     struct _TexInfo *next, *prev;
 

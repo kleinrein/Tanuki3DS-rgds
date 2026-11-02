@@ -936,6 +936,7 @@ void gpu_gl_state_loaded(GPU* gpu, GPU* from, const u8* blob) {
     g_pb.bound = false;
 
     // every texture comes from guest memory again
+    gpu_gl_shadows_drop(gpu);
     for (int i = 0; i < TEX_MAX; i++) {
         TexInfo* t = &gpu->textures.d[i];
         t->width = t->height = 0;
@@ -1088,11 +1089,148 @@ int g_etc_clamped, g_etc_blocks, g_etc_refused;
 
 static void gpu_gl_etc_start() { g_native_etc = !getenv("SPIKE_NOETC"); }
 
+// spike: shadow copies. Only ETC textures (the ones decoded on the CPU) get one, within a budget.
+static u64 g_shadow_bytes;
+#define SHADOW_MAX_ONE (8u << 20)
+#define SHADOW_MAX_ALL (96ull << 20)
+int g_tex_diffs, g_tex_difftiles, g_tex_new, g_tex_stalefull, g_tex_rehashfull, g_partial_fail[4],
+    g_tex_difffull;
+u64 g_ns_texdiff;
+static int g_tex_diffs_all, g_tex_difftiles_all; // whole run, for the exit summary
+static u64 g_ns_texdiff_all;
+static int g_create_reason; // 0 new or changed attributes, 1 stale bytes, 2 hash changed, 3 diff gave up
+
+static void tex_shadow_drop(TexInfo* tex) {
+    if (!tex->shadow) return;
+    g_shadow_bytes -= tex->shadow_size;
+    free(tex->shadow);
+    tex->shadow = nullptr;
+    tex->shadow_size = 0;
+}
+
+void gpu_gl_shadows_drop(GPU* gpu) {
+    for (int i = 0; i < TEX_MAX; i++) tex_shadow_drop(&gpu->textures.d[i]);
+}
+
+static void tex_shadow_refresh(GPU* gpu, TexInfo* tex) {
+    if ((tex->fmt != 12 && tex->fmt != 13) || getenv("SPIKE_NOSHADOW")) {
+        tex_shadow_drop(tex);
+        return;
+    }
+    if (tex->shadow && tex->shadow_size != tex->size) tex_shadow_drop(tex);
+    if (!tex->shadow) {
+        if (tex->size > SHADOW_MAX_ONE || g_shadow_bytes + tex->size > SHADOW_MAX_ALL) return;
+        tex->shadow = malloc(tex->size);
+        if (!tex->shadow) return;
+        tex->shadow_size = tex->size;
+        g_shadow_bytes += tex->size;
+    }
+    memcpy(tex->shadow, PTR(tex->paddr), tex->size);
+    tex->dirty_lo = tex->dirty_hi = 0;
+}
+
+// Decodes th rows of tw tiles (8x8 pixels each) of level l, read from `row` with `pitch` bytes
+// per row of tiles and `rowbytes` between rows, and uploads them at tile (tx, ty). The texture
+// is bound. False when an ETC-native texture meets a block it cannot flip exactly.
+static bool tex_upload_tiles(TexInfo* tex, int l, u32 lh, u32 tx, u32 ty, u32 tw, u32 th,
+                             const u8* row, u32 pitch, u32 rowbytes) {
+    u32 w = tw * 8, h = th * 8;
+    u8* raw = malloc(pitch * th);
+    u8* dec = malloc(w * h * 4);
+    for (u32 i = 0; i < th; i++) {
+        memcpy(raw + i * pitch, row + i * rowbytes, pitch);
+    }
+    bool ok = true;
+    if (tex->etcnative) {
+        int clamped = 0;
+        if (etc1_to_gpu(w, h, (void*) raw, 1, (void*) dec, &clamped)) {
+            g_etc_clamped += clamped;
+            glCompressedTexSubImage2D(GL_TEXTURE_2D, l, tx * 8, lh - (ty * 8 + h), w, h,
+                                      GL_COMPRESSED_RGB8_ETC2, w * h / 2, dec);
+        } else {
+            ok = false;
+        }
+    } else if (tex->fmt == 12) {
+        etc1_decompress_texture(w, h, (void*) raw, (void*) dec);
+        glTexSubImage2D(GL_TEXTURE_2D, l, tx * 8, lh - (ty * 8 + h), w, h, GL_RGB,
+                        GL_UNSIGNED_BYTE, dec);
+    } else {
+        etc1a4_decompress_texture(w, h, (void*) raw, (void*) dec);
+        glTexSubImage2D(GL_TEXTURE_2D, l, tx * 8, lh - (ty * 8 + h), w, h, GL_RGBA,
+                        GL_UNSIGNED_BYTE, dec);
+    }
+    free(raw);
+    free(dec);
+    return ok;
+}
+
+// Uploads the tiles whose bytes differ from the shadow copy within lo..hi. Returns the
+// number of tiles, 0 when nothing changed, -1 when the texture has to be rebuilt whole
+// (no shadow, a mip level too small for tiles, or a block the native path cannot flip).
+static int tex_diff_update(GPU* gpu, TexInfo* tex, u32 lo, u32 hi) {
+    if (!tex->shadow || tex->shadow_size != tex->size) return -1;
+    if (hi > tex->size) hi = tex->size;
+    if (lo >= hi) return 0;
+    u64 t0 = diag_now();
+    u32 tilebytes = tex->fmt == 12 ? 32 : 64;
+    const u8* guest = PTR(tex->paddr);
+    u32 off = 0;
+    int tiles = 0;
+    for (int l = tex->minlod; l <= tex->maxlod; l++) {
+        u32 lw = tex->width >> l, lh = tex->height >> l;
+        u32 levelsize = lw * lh * (tex->fmt == 12 ? 4 : 8) / 8;
+        if (off < hi && lo < off + levelsize) {
+            if (lw < 8 || lh < 8) return -1;
+            u32 rowbytes = lw / 8 * tilebytes, ntx = lw / 8;
+            u32 ty0 = (lo > off ? lo - off : 0) / rowbytes;
+            u32 end = hi < off + levelsize ? hi : off + levelsize;
+            u32 ty1 = (end - off + rowbytes - 1) / rowbytes;
+            if (ty1 > lh / 8) ty1 = lh / 8;
+            for (u32 ty = ty0; ty < ty1; ty++) {
+                u32 rowoff = off + ty * rowbytes;
+                const u8* g = guest + rowoff;
+                u8* s = tex->shadow + rowoff;
+                for (u32 tx = 0; tx < ntx;) {
+                    if (!memcmp(g + tx * tilebytes, s + tx * tilebytes, tilebytes)) {
+                        tx++;
+                        continue;
+                    }
+                    u32 run = 1;
+                    while (tx + run < ntx &&
+                           memcmp(g + (tx + run) * tilebytes, s + (tx + run) * tilebytes, tilebytes))
+                        run++;
+                    if (!tex_upload_tiles(tex, l, lh, tx, ty, run, 1, g + tx * tilebytes,
+                                          run * tilebytes, rowbytes)) {
+                        g_ns_texdiff += diag_now() - t0;
+                        return -1;
+                    }
+                    memcpy(s + tx * tilebytes, g + tx * tilebytes, run * tilebytes);
+                    tiles += run;
+                    tx += run;
+                }
+            }
+        }
+        off += levelsize;
+    }
+    u64 dt = diag_now() - t0;
+    g_ns_texdiff += dt;
+    g_ns_texdiff_all += dt;
+    g_tex_diffs_all++;
+    g_tex_difftiles_all += tiles;
+    return tiles;
+}
+
 static bool tex_partial_update(GPU* gpu, TexInfo* tex, u32 dstpaddr, u32 size,
                                u32 pitch, u32 gap) {
-    if ((tex->fmt != 12 && tex->fmt != 13) || !pitch || size % pitch) return false;
+    if ((tex->fmt != 12 && tex->fmt != 13) || !pitch || size % pitch) {
+        g_partial_fail[1]++;
+        return false;
+    }
     u32 tilebytes = tex->fmt == 12 ? 32 : 64;
-    if (pitch % tilebytes || dstpaddr < tex->paddr) return false;
+    if (pitch % tilebytes || dstpaddr < tex->paddr) {
+        g_partial_fail[2]++;
+        return false;
+    }
     u32 off = dstpaddr - tex->paddr;
     u32 th = size / pitch;
     for (int l = tex->minlod; l <= tex->maxlod; l++) {
@@ -1103,39 +1241,28 @@ static bool tex_partial_update(GPU* gpu, TexInfo* tex, u32 dstpaddr, u32 size,
             continue;
         }
         u32 rowbytes = lw / 8 * tilebytes;
-        if (pitch + gap != rowbytes || off % tilebytes) return false;
+        if (pitch + gap != rowbytes || off % tilebytes) {
+            g_partial_fail[2]++;
+            return false;
+        }
         u32 tx = (off % rowbytes) / tilebytes, ty = off / rowbytes;
         u32 tw = pitch / tilebytes;
-        if (tx + tw > lw / 8 || (ty + th) * 8 > lh) return false;
-        u32 w = tw * 8, h = th * 8;
-        u8* raw = malloc(pitch * th);
-        u8* dec = malloc(w * h * 4);
+        if (tx + tw > lw / 8 || (ty + th) * 8 > lh) {
+            g_partial_fail[2]++;
+            return false;
+        }
         u8* row = PTR(dstpaddr);
-        for (u32 i = 0; i < th; i++) {
-            memcpy(raw + i * pitch, row + i * rowbytes, pitch);
-        }
         glBindTexture(GL_TEXTURE_2D, tex->tex);
-        if (tex->etcnative) {
-            int clamped = 0;
-            if (!etc1_to_gpu(w, h, (void*) raw, 1, (void*) dec, &clamped)) {
-                free(raw);
-                free(dec);
-                return false;
-            }
-            g_etc_clamped += clamped;
-            glCompressedTexSubImage2D(GL_TEXTURE_2D, l, tx * 8, lh - (ty * 8 + h), w, h,
-                                      GL_COMPRESSED_RGB8_ETC2, w * h / 2, dec);
-        } else if (tex->fmt == 12) {
-            etc1_decompress_texture(w, h, (void*) raw, (void*) dec);
-            glTexSubImage2D(GL_TEXTURE_2D, l, tx * 8, lh - (ty * 8 + h), w, h,
-                            GL_RGB, GL_UNSIGNED_BYTE, dec);
-        } else {
-            etc1a4_decompress_texture(w, h, (void*) raw, (void*) dec);
-            glTexSubImage2D(GL_TEXTURE_2D, l, tx * 8, lh - (ty * 8 + h), w, h,
-                            GL_RGBA, GL_UNSIGNED_BYTE, dec);
+        if (!tex_upload_tiles(tex, l, lh, tx, ty, tw, th, row, pitch, rowbytes)) {
+            g_partial_fail[2]++;
+            return false;
         }
-        free(raw);
-        free(dec);
+        if (tex->shadow && tex->shadow_size == tex->size) {
+            u32 soff = dstpaddr - tex->paddr;
+            for (u32 i = 0; i < th; i++) {
+                memcpy(tex->shadow + soff + i * rowbytes, row + i * rowbytes, pitch);
+            }
+        }
         tex->hash = gpu_hash_texture(PTR(tex->paddr), tex->size);
         tex->needs_rehash = false;
         tex->content = XXH3_64bits(PTR(tex->paddr), tex->size);
@@ -1185,6 +1312,7 @@ void gpu_gl_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
             glBindFramebuffer(GL_READ_FRAMEBUFFER, srcfb->fbo);
             glBindTexture(GL_TEXTURE_2D, dsttex->tex);
             dsttex->etcnative = false;
+            tex_shadow_drop(dsttex);
             glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0,
                              (srcfb->height - dsttex->height - yoff) *
                                  ctremu.videoscale,
@@ -1240,6 +1368,8 @@ void gpu_gl_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
         tex_partial_update(gpu, dsttex, dstpaddr, size, dstpitch, dstgap)) {
         return;
     }
+    if (!dsttex) g_partial_fail[3]++;
+    else if (srcpitch != dstpitch) g_partial_fail[0]++;
 
     gpu_invalidate_range(gpu, dstpaddr, size);
 }
@@ -1583,11 +1713,16 @@ void gpu_gl_print_texstat() {
     extern int g_etc_clamped, g_etc_blocks, g_etc_refused;
     fprintf(stderr, "spike etc blocks %d clamped %d refused %d\n", g_etc_blocks, g_etc_clamped,
             g_etc_refused);
-    fprintf(stderr, "spike stale textures: same %d changed %d of which seen before %d\n", g_tex_same,
-            g_tex_changed, g_tex_again);
+    spike_logf("spike stale textures: same %d changed %d of which seen before %d\n", g_tex_same,
+               g_tex_changed, g_tex_again);
+    spike_logf("spike tex diffs %d tiles %d ms %.0f gave up %d; copies not partial: pitch %d "
+               "format %d geometry %d no texture %d; shadows %.1f MB\n",
+               g_tex_diffs_all, g_tex_difftiles_all, g_ns_texdiff_all / 1e6, g_tex_difffull,
+               g_partial_fail[0], g_partial_fail[1], g_partial_fail[2], g_partial_fail[3],
+               g_shadow_bytes / 1048576.0);
     for (int i = 0; i < 16; i++) {
         if (!g_texstat[i].n) continue;
-        fprintf(stderr, "spike tex fmt %d: n %d pixels %llu ms %.0f sync %.0f max %.1f\n", i,
+        spike_logf("spike tex fmt %d: n %d pixels %llu ms %.0f sync %.0f max %.1f\n", i,
                 g_texstat[i].n, (unsigned long long) g_texstat[i].pixels, g_texstat[i].ns / 1e6,
                 g_texstat[i].ns_sync / 1e6, g_texstat[i].ns_max / 1e6);
     }
@@ -1604,8 +1739,18 @@ static void create_texture(GPU* gpu, TexInfo* tex, TexUnitRegs* regs) {
         g_texstat[tex->fmt & 15].ns_sync += diag_now() - t0;
     }
     create_texture_real(gpu, tex, regs);
+    tex_shadow_refresh(gpu, tex);
     u64 dt = diag_now() - t0;
     g_ns_textures += dt;
+    static int texlog = -1;
+    if (texlog < 0) texlog = getenv("SPIKE_TEXLOG") != nullptr;
+    if (texlog) {
+        static const char* why[] = {"new", "stale", "rehash", "diff-gave-up"};
+        spike_logf("tex create %08x fmt %d %dx%d lod %d-%d %s %.1f ms\n", tex->paddr, tex->fmt,
+                   tex->width, tex->height, tex->minlod, tex->maxlod, why[g_create_reason & 3],
+                   dt / 1e6);
+    }
+    g_create_reason = 0;
     typeof(&g_texstat[0]) st = &g_texstat[tex->fmt & 15];
     st->n++;
     st->pixels += tex->width * tex->height;
@@ -1715,23 +1860,42 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
             tex->stale = false;
             tex->content = XXH3_64bits(data, tex->size);
 
+            g_tex_new++;
+            g_create_reason = 0;
             create_texture(gpu, tex, regs);
         } else if (tex->stale) {
             tex->stale = false;
-            u64 content = XXH3_64bits(PTR(tex->paddr), tex->size);
-            if (content == tex->content) {
-                g_tex_same++;
-            } else {
-                tex->content = content;
+            u32 lo = tex->dirty_lo, hi = tex->dirty_hi;
+            tex->dirty_lo = tex->dirty_hi = 0;
+            int r = tex_diff_update(gpu, tex, lo, hi);
+            if (r > 0) {
+                g_tex_diffs++;
+                g_tex_difftiles += r;
+                g_tex_changed++;
+                tex->content = XXH3_64bits(PTR(tex->paddr), tex->size);
                 tex->hash = gpu_hash_texture(PTR(tex->paddr), tex->size);
                 tex->needs_rehash = false;
-                g_tex_changed++;
-                // has this picture been here before?
-                static u64 seen[1 << 14];
-                u32 at = content % (1 << 14);
-                if (seen[at] == content) g_tex_again++;
-                seen[at] = content;
-                create_texture(gpu, tex, regs);
+            } else if (r == 0) {
+                g_tex_same++;
+            } else {
+                u64 content = XXH3_64bits(PTR(tex->paddr), tex->size);
+                if (content == tex->content) {
+                    g_tex_same++;
+                } else {
+                    tex->content = content;
+                    tex->hash = gpu_hash_texture(PTR(tex->paddr), tex->size);
+                    tex->needs_rehash = false;
+                    g_tex_changed++;
+                    // has this picture been here before?
+                    static u64 seen[1 << 14];
+                    u32 at = content % (1 << 14);
+                    if (seen[at] == content) g_tex_again++;
+                    seen[at] = content;
+                    if (tex->shadow) g_tex_difffull++;
+                    g_tex_stalefull++;
+                    g_create_reason = tex->shadow ? 3 : 1;
+                    create_texture(gpu, tex, regs);
+                }
             }
         } else if (tex->needs_rehash) {
             void* data = PTR(tex->paddr);
@@ -1739,7 +1903,18 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
             tex->needs_rehash = false;
             if (hash != tex->hash) {
                 tex->hash = hash;
-                create_texture(gpu, tex, regs);
+                int r = tex_diff_update(gpu, tex, 0, tex->size);
+                if (r >= 0) {
+                    if (r > 0) {
+                        g_tex_diffs++;
+                        g_tex_difftiles += r;
+                        tex->content = XXH3_64bits(data, tex->size);
+                    }
+                } else {
+                    g_tex_rehashfull++;
+                    g_create_reason = 2;
+                    create_texture(gpu, tex, regs);
+                }
             }
         }
     } else {

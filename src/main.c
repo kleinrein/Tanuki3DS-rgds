@@ -5,6 +5,7 @@
 #include <sys/resource.h>
 #include <SDL3/SDL_main.h>
 #include <getopt.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,6 +151,53 @@ static int spike_win_audio = 1 << 30, spike_win_empty;
 static const char* spike_tag = "";
 static bool spike_noquit;
 static SDL_Window* g_window2;
+// spike: every run's numbers in logs/<time>-<rom>.log beside the settings, the newest 30 kept,
+// because the launcher's log holds one run and the next launch overwrites it
+static FILE* g_runlog;
+static void runlog_open() {
+    static bool tried;
+    if (tried || !ctremu.romfilenoext) return;
+    tried = true;
+    mkdir("logs", 0777);
+    struct dirent** names;
+    int n = scandir("logs", &names, nullptr, alphasort);
+    if (n >= 0) {
+        for (int i = 0; i < n; i++) {
+            const char* name = names[i]->d_name;
+            if (name[0] != '.' && n - i > 29) {
+                char path[300];
+                snprintf(path, sizeof path, "logs/%s", name);
+                unlink(path);
+            }
+            free(names[i]);
+        }
+        free(names);
+    }
+    const char* rom = strrchr(ctremu.romfilenoext, '/');
+    rom = rom ? rom + 1 : ctremu.romfilenoext;
+    char stamp[32];
+    time_t now = time(nullptr);
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
+    char path[300];
+    snprintf(path, sizeof path, "logs/%s-%.40s.log", stamp, rom);
+    g_runlog = fopen(path, "w");
+    if (g_runlog) fprintf(g_runlog, "Tanuki3DS %s %s\n", EMUVERSION, ctremu.romfilenoext);
+}
+
+void spike_logf(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    if (!g_runlog) runlog_open();
+    if (g_runlog) {
+        va_start(ap, fmt);
+        vfprintf(g_runlog, fmt, ap);
+        va_end(ap);
+        fflush(g_runlog);
+    }
+}
+
 static void spike_frame_done(int w, int h) {
     const char* every = getenv("SPIKE_SHOT_EVERY");
     const char* dir = getenv("SPIKE_SHOTS");
@@ -1184,20 +1232,26 @@ int main(int argc, char** argv) {
                      EMUVERSION, ctremu.system.romimage.name, fps,
                      avg_frame_time / avg_frame_time_ct);
             SDL_SetWindowTitle(g_window, wintitle);
-            fprintf(stderr, "%s\n", wintitle); // spike: fps on stderr
+            {
+                char stamp[16];
+                time_t now = time(nullptr);
+                strftime(stamp, sizeof stamp, "%H:%M:%S", localtime(&now));
+                spike_logf("%s %s\n", stamp, wintitle); // spike: fps on stderr and the run log
+            }
             if (gpu_worker_on()) {
                 double busy, present, wait;
                 int copies, wraps, n = frame - prev_fps_frame;
                 gpu_worker_stats(&busy, &present, &wait, &copies, &wraps);
                 if (n) {
-                    fprintf(stderr,
+                    spike_logf(
                             "worker: busy %.1f present %.1f, main wait %.1f ms/frame, "
                             "copies %d wraps %d drawn %d/%d lutmiss %d guest %d "
                             "draws %d creates %d partial %d behind %.2f audio %d "
                             "| maxmain %.0f maxgap %.0f minaudio %d empty %d links %d "
                             "ms: link %.0f compile %.0f tex %.0f clip %d auddev %.0f "
                             "progwait %.0f progs %d/%d jit %d/%d ms %.1f max %.1f "
-                            "pre %d/%d ms %.1f arena %.1f swaps %.1f+%.1f %.1f+%.1f lost %d\n",
+                            "pre %d/%d ms %.1f arena %.1f swaps %.1f+%.1f %.1f+%.1f lost %d "
+                            "texdiff %d tiles %d ms %.0f new/stale/rehash %d/%d/%d\n",
                             busy / n, present / n, wait / n, copies, wraps,
                             gpu_worker_drawn(), n, g_lut_misses, gpu_worker_transfers(),
                             g_draws / (n ? n : 1), g_tex_creates, g_tex_partial,
@@ -1213,7 +1267,10 @@ int main(int argc, char** argv) {
                             g_present_ns[0][1] / 1e6 / (g_present_n ? g_present_n : 1),
                             g_present_ns[1][0] / 1e6 / (g_present_n ? g_present_n : 1),
                             g_present_ns[1][1] / 1e6 / (g_present_n ? g_present_n : 1),
-                            gpu_worker_lost());
+                            gpu_worker_lost(), g_tex_diffs, g_tex_difftiles, g_ns_texdiff / 1e6,
+                            g_tex_new, g_tex_stalefull, g_tex_rehashfull);
+                    g_tex_diffs = g_tex_difftiles = g_tex_new = g_tex_stalefull = g_tex_rehashfull = 0;
+                    g_ns_texdiff = 0;
                     memset(g_present_ns, 0, sizeof g_present_ns);
                     g_present_n = 0;
                     g_jit_pre_roots = g_jit_pre_blocks = 0;

@@ -14,6 +14,9 @@
 
 extern bool g_infologs;
 
+// spike: stderr and the per-run log in logs/ (main.c)
+void spike_logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
 #define linfo(format, ...)                                                     \
     (g_infologs ? printf("\e[32m[INFO](%s) " format "\e[0m\n",                 \
                          __func__ __VA_OPT__(, ) __VA_ARGS__)                  \

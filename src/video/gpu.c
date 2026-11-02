@@ -862,7 +862,13 @@ static void gw_invalidate(GPU* gpu, u32 paddr, u32 len) {
         auto t = &gpu->textures.d[i];
         // The same bytes are often written again (3D Land copies its textures to VRAM each frame):
         // whether that matters is decided by a hash on the next use.
-        if (t->paddr && t->paddr < paddr + len && paddr < t->paddr + t->size) t->stale = true;
+        if (t->paddr && t->paddr < paddr + len && paddr < t->paddr + t->size) {
+            u32 lo = paddr > t->paddr ? paddr - t->paddr : 0;
+            u32 hi = paddr + len < t->paddr + t->size ? paddr + len - t->paddr : t->size;
+            if (!t->stale || lo < t->dirty_lo) t->dirty_lo = lo;
+            if (!t->stale || hi > t->dirty_hi) t->dirty_hi = hi;
+            t->stale = true;
+        }
     }
 }
 
