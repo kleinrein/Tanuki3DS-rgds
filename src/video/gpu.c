@@ -12,8 +12,10 @@
 #include "gpuptr.inc"
 #include "gpu_hash.h"
 
+#include <linux/futex.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -103,6 +105,44 @@ static inline void gw_relax(int* n) {
     }
 }
 
+// spike: the renderer thread used to spin on sched_yield while waiting for commands, and the
+// main thread while waiting for presents: two cores busy with nothing, which is heat, which
+// trips the chip's 70 C throttle after about 90 s of a race. Now each side spins briefly and
+// then sleeps on a futex; the other side wakes it only when it said it was asleep
+// (both store then load, so no wake-up is lost). SPIKE_SPINWAIT=1 keeps the old spinning.
+static atomic_uint g_worker_sleeping, g_main_sleeping;
+static int g_spinwait = -1;
+static inline void gw_cpu_relax(void) {
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#endif
+}
+static void gw_futex_wait(atomic_uint* addr, u32 expected) {
+    syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+}
+static void gw_futex_wake(atomic_uint* addr) {
+    syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+// main thread: waits while *addr still reads `seen`
+static void gw_wait_main(atomic_uint* addr, u32 seen) {
+    if (g_spinwait < 0) g_spinwait = getenv("SPIKE_SPINWAIT") != nullptr;
+    for (int i = 0; i < 1000; i++) {
+        if (atomic_load_explicit(addr, memory_order_acquire) != seen) return;
+        gw_cpu_relax();
+    }
+    if (g_spinwait) {
+        int n = 0;
+        while (atomic_load_explicit(addr, memory_order_acquire) == seen) gw_relax(&n);
+        return;
+    }
+    atomic_store_explicit(&g_main_sleeping, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(addr, memory_order_seq_cst) == seen) gw_futex_wait(addr, seen);
+    atomic_store_explicit(&g_main_sleeping, 0, memory_order_seq_cst);
+}
+static inline void gw_wake_main(atomic_uint* addr) {
+    if (atomic_load_explicit(&g_main_sleeping, memory_order_seq_cst)) gw_futex_wake(addr);
+}
+
 static void gw_push(u32 type, u32 a0, u32 a1, u32 a2, u32 a3, u32 a4, u32 a5,
                     u32 a6, u32 a7) {
     u32 head = atomic_load_explicit(&g_w.msg_head, memory_order_relaxed);
@@ -117,7 +157,8 @@ static void gw_push(u32 type, u32 a0, u32 a1, u32 a2, u32 a3, u32 a4, u32 a5,
     }
     g_w.msgs[head % GW_MSGS] =
         (GWMsg) {type, {a0, a1, a2, a3, a4, a5, a6, a7}};
-    atomic_store_explicit(&g_w.msg_head, head + 1, memory_order_release);
+    atomic_store_explicit(&g_w.msg_head, head + 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_worker_sleeping, memory_order_seq_cst)) gw_futex_wake(&g_w.msg_head);
 }
 
 bool gpu_worker_is_this_thread() {
@@ -170,9 +211,11 @@ void gpu_worker_sync(bool finish) {
     gw_push(GW_SYNC, finish, 0, 0, 0, 0, 0, 0, 0);
     u32 head = atomic_load_explicit(&g_w.msg_head, memory_order_relaxed);
     u64 t0 = gw_now();
-    int n = 0;
-    while (atomic_load_explicit(&g_w.msg_tail, memory_order_acquire) != head)
-        gw_relax(&n);
+    for (;;) {
+        u32 tail = atomic_load_explicit(&g_w.msg_tail, memory_order_acquire);
+        if (tail == head) break;
+        gw_wait_main(&g_w.msg_tail, tail);
+    }
     g_w.wait_ns += gw_now() - t0;
 }
 
@@ -202,13 +245,17 @@ void gpu_worker_present(int w, int h) {
     int n = 0;
     // with skipping the rule is only there to stop runaway queues
     u32 ahead = g_w.can_skip ? 6 : 1;
-    while (atomic_load_explicit(&g_w.presents_done, memory_order_acquire) + ahead <
-           g_w.presents)
-        gw_relax(&n);
+    (void) n;
+    for (;;) {
+        u32 done = atomic_load_explicit(&g_w.presents_done, memory_order_acquire);
+        if (done + ahead >= g_w.presents) break;
+        gw_wait_main(&g_w.presents_done, done);
+    }
     g_w.wait_ns += gw_now() - t0;
 }
 
 static void gw_exec_cmds(GPU* gpu, u32* cur, u32* end);
+static int g_layout_log = -1; // SPIKE_LAYOUTLOG=1, see gw_layout_log
 static void gw_invalidate(GPU* gpu, u32 paddr, u32 len);
 static void gw_rehash(GPU* gpu);
 
@@ -222,12 +269,22 @@ static void* gw_main(void* arg) {
         pthread_setaffinity_np(pthread_self(), sizeof set, &set);
     }
     g_w.bind(true);
+    if (g_spinwait < 0) g_spinwait = getenv("SPIKE_SPINWAIT") != nullptr;
     int idle = 0;
     bool quit = false;
     while (!quit) {
         u32 tail = atomic_load_explicit(&g_w.msg_tail, memory_order_relaxed);
         if (tail == atomic_load_explicit(&g_w.msg_head, memory_order_acquire)) {
-            gw_relax(&idle);
+            if (g_spinwait || ++idle < 2000) {
+                if (g_spinwait) gw_relax(&idle);
+                else gw_cpu_relax();
+                continue;
+            }
+            atomic_store_explicit(&g_worker_sleeping, 1, memory_order_seq_cst);
+            if (atomic_load_explicit(&g_w.msg_head, memory_order_seq_cst) == tail) {
+                gw_futex_wait(&g_w.msg_head, tail);
+            }
+            atomic_store_explicit(&g_worker_sleeping, 0, memory_order_seq_cst);
             continue;
         }
         idle = 0;
@@ -290,7 +347,8 @@ static void* gw_main(void* arg) {
                     g_w.last_present = now;
                 }
                 atomic_fetch_add_explicit(&g_w.presents_done, 1,
-                                          memory_order_release);
+                                          memory_order_seq_cst);
+                gw_wake_main(&g_w.presents_done);
                 atomic_fetch_add(&g_w.present_ns, gw_now() - t0);
                 break;
             }
@@ -301,7 +359,8 @@ static void* gw_main(void* arg) {
                 quit = true;
                 break;
         }
-        atomic_store_explicit(&g_w.msg_tail, tail + 1, memory_order_release);
+        atomic_store_explicit(&g_w.msg_tail, tail + 1, memory_order_seq_cst);
+        gw_wake_main(&g_w.msg_tail);
         atomic_fetch_add(&g_w.busy_ns, gw_now() - t0);
     }
     g_w.bind(false);
@@ -310,6 +369,7 @@ static void* gw_main(void* arg) {
 
 void gpu_worker_start(GPU* gpu, void (*bind)(bool), void (*present)(int, int)) {
     if (g_w.on) return;
+    if (g_layout_log < 0) g_layout_log = getenv("SPIKE_LAYOUTLOG") != nullptr;
     if (!g_w.msgs) {
         g_w.msgs = malloc(GW_MSGS * sizeof(GWMsg));
         g_w.cmd = malloc(GW_CMD_RING);
@@ -656,6 +716,60 @@ static void gw_exec_cmds(GPU* gpu, u32* cur, u32* end) {
     }
 }
 
+void gpu_vbo_layout(const GPURegs* regs, int vbo, VboLayout* out) {
+    static const int typesize[4] = {1, 1, 2, 4};
+    u32 instride = regs->geom.attrbuf[vbo].size;
+    u32 inoff = 0, off = 0, maxcs = 1;
+    out->n = 0;
+    out->changed = false;
+    for (int c = 0; c < regs->geom.attrbuf[vbo].count; c++) {
+        int attr = (regs->geom.attrbuf[vbo].comp >> 4 * c) & 0xf;
+        if (attr >= 0xc) {
+            inoff += 4 * (attr - 0xb);
+            continue;
+        }
+        int fmt = (regs->geom.attr_format >> 4 * attr) & 0xf;
+        int size = (fmt >> 2) + 1, type = fmt & 3, cs = typesize[type];
+        int outsize = type == 2 && size == 3 ? 4 : size;
+        off = (off + cs - 1) & ~(u32) (cs - 1);
+        auto a = &out->a[out->n++];
+        a->attr = attr;
+        a->size = outsize;
+        a->insize = size;
+        a->type = type;
+        a->inoff = inoff;
+        a->off = off;
+        if (off != inoff || outsize != size) out->changed = true;
+        if ((u32) cs > maxcs) maxcs = cs;
+        inoff += size * cs;
+        off += outsize * cs;
+    }
+    if (!out->changed && instride % maxcs == 0) {
+        out->stride = instride;
+    } else {
+        out->changed = true;
+        out->stride = (off + maxcs - 1) & ~(maxcs - 1);
+    }
+}
+
+// SPIKE_LAYOUTLOG=1: each distinct vertex buffer layout once in the run log, with the index size
+static void gw_layout_log(const GPURegs* regs, int vbo, const VboLayout* lay, int index) {
+    static u64 seen[256];
+    static int nseen;
+    u64 key = XXH3_64bits(lay, sizeof *lay) ^ regs->geom.attrbuf[vbo].size ^ (u64) index << 60;
+    for (int i = 0; i < nseen; i++) if (seen[i] == key) return;
+    if (nseen == countof(seen)) return;
+    seen[nseen++] = key;
+    static const char* tn[4] = {"s8", "u8", "s16", "f32"};
+    char line[512];
+    int n = snprintf(line, sizeof line, "layout: idx%s stride %u -> %u%s:", index == 0 ? "-" : index == 1 ? "8" : "16",
+                     (u32) regs->geom.attrbuf[vbo].size, lay->stride, lay->changed ? " relaid" : "");
+    for (int i = 0; i < lay->n && n < (int) sizeof line - 40; i++)
+        n += snprintf(line + n, sizeof line - n, " a%d %sx%d@%u", lay->a[i].attr, tn[lay->a[i].type], lay->a[i].insize,
+                      lay->a[i].inoff);
+    spike_logf("%s\n", line);
+}
+
 // copies one draw's guest data out, the same ranges the draw will use
 static void gw_snap_draw(GPU* gpu, GPURegs* regs, bool elements, DrawSnap* snap) {
     int basevert = regs->geom.vtx_off;
@@ -694,8 +808,32 @@ static void gw_snap_draw(GPU* gpu, GPURegs* regs, bool elements, DrawSnap* snap)
         void* data =
             PTR(regs->geom.attr_base * 8 + regs->geom.attrbuf[vbo].offset);
         u32 stride = regs->geom.attrbuf[vbo].size;
-        snap->vbo[vbo] = gpu_gl_vstream_put(data + basevert * stride,
-                                            nbufverts * stride, 16);
+        VboLayout lay;
+        gpu_vbo_layout(regs, vbo, &lay);
+        if (g_layout_log) gw_layout_log(regs, vbo, &lay, elements ? 1 + regs->geom.indexfmt : 0);
+        if (lay.changed && nbufverts > 0) {
+            // laid out for the driver, attribute by attribute (see VboLayout)
+            static const int typesize[4] = {1, 1, 2, 4};
+            u32 bytes = nbufverts * lay.stride;
+            u32 at = gpu_gl_vstream_put(nullptr, bytes, 16);
+            u8* dst = gpu_gl_vstream_ptr() + at;
+            const u8* src = data + basevert * stride;
+            for (int v = 0; v < nbufverts; v++, src += stride, dst += lay.stride) {
+                for (int i = 0; i < lay.n; i++) {
+                    int cs = typesize[lay.a[i].type];
+                    memcpy(dst + lay.a[i].off, src + lay.a[i].inoff, lay.a[i].insize * cs);
+                    if (lay.a[i].size != lay.a[i].insize) {
+                        // short3 -> short4: w = 1, as a scaled integer it reads as 1.0
+                        *(s16*) (dst + lay.a[i].off + 6) = 1;
+                    }
+                }
+            }
+            snap->vbo[vbo] = at;
+            g_draws_relaid++;
+        } else {
+            snap->vbo[vbo] = gpu_gl_vstream_put(data + basevert * stride,
+                                                nbufverts * stride, 16);
+        }
         if (g_draw_dump) snap->vhash ^= XXH3_64bits(data + basevert * stride, nbufverts * stride);
     }
 }

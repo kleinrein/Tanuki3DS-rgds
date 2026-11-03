@@ -482,6 +482,15 @@ void rgds_bridge_autoload() {
     if (loaded) savestate_read_finish(loaded);
     fprintf(stderr, "rgds bridge: state at start read in %.0f ms: %d\n",
             (SDL_GetTicksNS() - t0) / 1e6, loaded != nullptr);
+    // tools/tanuki3ds/state-check.sh: what was just read, written again, must be the same bytes
+    const char* again = getenv("RGDS_STATE_AGAIN");
+    if (loaded && again) {
+        u64 size = 0;
+        void* blob = savestate_capture(&size);
+        bool same = savestate_write(again, blob, size);
+        free(blob);
+        fprintf(stderr, "rgds bridge: state written again: %d\n", same);
+    }
     if (wrecked) ctremu.running = false;
 }
 

@@ -86,10 +86,11 @@ u32 gpu_gl_vstream_put(const void* data, size_t size, size_t align) {
         g_vstream_wrap_at = g_vstream_presents;
         off = 0;
     }
-    if (size) memcpy(g_vstream_ptr + off, data, size);
+    if (size && data) memcpy(g_vstream_ptr + off, data, size);
     g_vstream_off = off + size;
     return off;
 }
+u8* gpu_gl_vstream_ptr() { return g_vstream_ptr; }
 
 // spike: light tables by content
 #define LUT_CACHE 32
@@ -199,6 +200,7 @@ void renderer_gl_init(GLState* state, GPU* gpu) {
         glBindBuffer(GL_ARRAY_BUFFER, g_vstream);
         bufferStorage(GL_ARRAY_BUFFER, VSTREAM_SIZE, nullptr, flags);
         g_vstream_ptr = glMapBufferRange(GL_ARRAY_BUFFER, 0, VSTREAM_SIZE, flags);
+        // spike: the same again for vertex data the renderer thread lays out aligned
     }
     g_stream_off = 0;
     g_vstream_off = 0;
@@ -385,7 +387,14 @@ void renderer_gl_destroy(GLState* state, GPU* gpu) {
 }
 
 // call before emulating gpu drawing
+u32 g_tex_frame; // spike: counts frames, so a texture's whole-content check happens once a frame
+static void tsq_begin(void);
+static void gls_invalidate(void);
+static void gls_textures_unknown(void);
 void gpu_gl_start_frame(GPU* gpu) {
+    g_tex_frame++;
+    gls_invalidate();
+    tsq_begin();
     prog_unbind();
     glBindFramebuffer(GL_FRAMEBUFFER, gpu->curfb->fbo);
     if (g_wireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
@@ -399,6 +408,7 @@ bool (*gpu_gl_panel_ground)();
 
 void render_gl_main(GLState* state) {
     // reset gl for drawing the main window
+    gls_invalidate();
     glUseProgram(state->main_program);
     glBindVertexArray(state->main_vao);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -430,6 +440,228 @@ void render_gl_main(GLState* state) {
         }
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
+}
+
+// spike: present sets. The renderer thread copies the two screens into a set (two small blits)
+// and the present thread draws the panels from it, so the renderer never waits for a vblank.
+#define PSETS 8
+static GLuint g_pset_tex[PSETS][2], g_pset_fbo[PSETS][2];
+static GLsync g_pset_ready[PSETS]; // the writes into the set are done (renderer thread)
+static GLsync g_pset_done[PSETS];  // the panels were drawn from it (present thread)
+static int g_pset_last = -1, g_pset_filter = -1;
+// direct mode: the display transfers write into a set themselves, no copy; a frame hands over
+// the set that holds each screen's latest image (a screen the game did not redraw keeps its set)
+static bool g_pset_direct;
+static int (*g_pset_busy)(int* out);
+static int g_pset_write = -1, g_pset_screen[2] = {-1, -1};
+
+void gpu_gl_present_direct(bool on, int (*busy)(int* out)) {
+    g_pset_direct = on && !getenv("SPIKE_PRESENT_COPY");
+    g_pset_busy = busy;
+}
+
+// spike: GPU time per frame from timestamp queries at frame start and hand-over
+u64 g_gpu_ns;
+int g_gpu_n;
+static GLuint g_tsq[8][2];
+static bool g_tsq_open[8], g_tsq_off;
+static int g_tsq_cur = -1;
+static void tsq_poll() {
+    for (int i = 0; i < 8; i++) {
+        if (!g_tsq_open[i] || i == g_tsq_cur) continue;
+        GLuint avail = 0;
+        glGetQueryObjectuiv(g_tsq[i][1], GL_QUERY_RESULT_AVAILABLE, &avail);
+        if (!avail) continue;
+        GLuint64 t0 = 0, t1 = 0;
+        glGetQueryObjectui64v(g_tsq[i][0], GL_QUERY_RESULT, &t0);
+        glGetQueryObjectui64v(g_tsq[i][1], GL_QUERY_RESULT, &t1);
+        if (t1 > t0 && t1 - t0 < 1000000000ull) {
+            g_gpu_ns += t1 - t0;
+            g_gpu_n++;
+        }
+        g_tsq_open[i] = false;
+    }
+}
+static void tsq_begin() {
+    // opt-in: polling a timestamp query's result waits in the driver (12% of the renderer
+    // thread in a race) and ending one starts a fresh batch
+    static int on = -1;
+    if (on < 0) on = getenv("SPIKE_GPUTIME") != nullptr;
+    if (g_tsq_off || !on) return;
+    if (!g_tsq[0][0]) {
+        glGetError();
+        glGenQueries(16, &g_tsq[0][0]);
+        glQueryCounter(g_tsq[0][0], GL_TIMESTAMP);
+        if (glGetError() != GL_NO_ERROR) {
+            g_tsq_off = true;
+            fprintf(stderr, "spike: no timestamp queries\n");
+            return;
+        }
+    }
+    tsq_poll();
+    int i = -1;
+    for (int k = 0; k < 8; k++) {
+        if (!g_tsq_open[k]) {
+            i = k;
+            break;
+        }
+    }
+    if (i < 0) return;
+    g_tsq_cur = i;
+    g_tsq_open[i] = true;
+    glQueryCounter(g_tsq[i][0], GL_TIMESTAMP);
+}
+static void tsq_end() {
+    if (g_tsq_cur < 0) return;
+    glQueryCounter(g_tsq[g_tsq_cur][1], GL_TIMESTAMP);
+    g_tsq_cur = -1;
+}
+
+static void pset_init(GLState* state) {
+    glGenTextures(PSETS * 2, &g_pset_tex[0][0]);
+    glGenFramebuffers(PSETS * 2, &g_pset_fbo[0][0]);
+    for (int s = 0; s < PSETS; s++) {
+        for (int i = 0; i < 2; i++) {
+            glBindTexture(GL_TEXTURE_2D, g_pset_tex[s][i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SCREEN_HEIGHT * ctremu.videoscale,
+                         SCREEN_WIDTH(i) * ctremu.videoscale, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_pset_fbo[s][i]);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, g_pset_tex[s][i], 0);
+        }
+    }
+}
+
+// renderer thread: a set that no queued or drawing frame refers to and that holds no screen's
+// latest image; the GPU must be done drawing from it before it is written again
+static int pset_pick(GLState* state) {
+    if (!g_pset_tex[0][0]) pset_init(state);
+    int avoid[6], n = g_pset_busy ? g_pset_busy(avoid) : 0;
+    avoid[n++] = g_pset_screen[0];
+    avoid[n++] = g_pset_screen[1];
+    int s = g_pset_last;
+    for (int tries = 0; tries < PSETS; tries++) {
+        s = (s + 1) % PSETS;
+        bool bad = false;
+        for (int i = 0; i < n; i++) bad |= avoid[i] == s;
+        if (!bad) break;
+    }
+    g_pset_last = s;
+    // Writing a set the present thread drew from a few frames ago needs no wait here: Panfrost's
+    // kernel driver orders the write after earlier reads of the same buffer (implicit sync),
+    // and a client wait is a glthread sync point that drains the whole queue, so the driver
+    // thread and this one stop overlapping once a frame (at the clock the chip throttles to
+    // after ten minutes of racing that cost frames: 99.5% -> 99.8% drawn without it, and the
+    // driver thread 39% -> 34% of a core). SPIKE_PSETWAIT=1 waits anyway, for comparison.
+    static int wait = -1;
+    if (wait < 0) wait = getenv("SPIKE_PSETWAIT") != nullptr;
+    if (g_pset_done[s]) {
+        if (wait) glClientWaitSync(g_pset_done[s], GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);
+        glDeleteSync(g_pset_done[s]);
+        g_pset_done[s] = nullptr;
+    }
+    return s;
+}
+
+// where a display transfer draws screen `screen` this frame
+static GLuint screen_target_fbo(GPU* gpu, int screen) {
+    if (!g_pset_direct) return gpu->gl.screenfbo[screen];
+    if (g_pset_write < 0) g_pset_write = pset_pick(&gpu->gl);
+    g_pset_screen[screen] = g_pset_write;
+    return g_pset_fbo[g_pset_write][screen];
+}
+
+// renderer thread, at hand-over: the sets holding each screen's latest image (direct mode), or
+// one set the screens are copied into
+void gpu_gl_present_finish(GLState* state, int sets[2]) {
+    tsq_end();
+    int s;
+    if (g_pset_direct) {
+        s = g_pset_write;
+        if (s < 0) {
+            // nothing was drawn to the screens this frame: hand the last images over again
+            s = g_pset_screen[0] >= 0 ? g_pset_screen[0] : pset_pick(state);
+            if (g_pset_screen[0] < 0) g_pset_screen[0] = s;
+            if (g_pset_screen[1] < 0) g_pset_screen[1] = s;
+        }
+        g_pset_write = -1;
+        sets[0] = g_pset_screen[0];
+        sets[1] = g_pset_screen[1];
+    } else {
+        s = pset_pick(state);
+        gls_invalidate();
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(true, true, true, true);
+        for (int i = 0; i < 2; i++) {
+            int w = SCREEN_HEIGHT * ctremu.videoscale, h = SCREEN_WIDTH(i) * ctremu.videoscale;
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, state->screenfbo[i]);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_pset_fbo[s][i]);
+            glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        sets[0] = sets[1] = s;
+    }
+    if (g_pset_ready[s]) glDeleteSync(g_pset_ready[s]);
+    g_pset_ready[s] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+}
+
+// present thread, in its own context: render_gl_main from the frame's sets
+void gpu_gl_present_draw(GLState* state, const int sets[2], GLuint vao) {
+    for (int i = 0; i < 2; i++) {
+        if (g_pset_ready[sets[i]]) glWaitSync(g_pset_ready[sets[i]], 0, GL_TIMEOUT_IGNORED);
+    }
+    glUseProgram(state->main_program);
+    glBindVertexArray(vao);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMask(true, true, true, true);
+    glDisable(GL_BLEND);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glActiveTexture(GL_TEXTURE0);
+    if (gpu_gl_panel_ground && gpu_gl_panel_ground()) glUseProgram(state->main_program);
+    if (g_pset_filter != ctremu.outputfilter) {
+        g_pset_filter = ctremu.outputfilter;
+        GLint f = g_pset_filter == FILTER_NEAREST ? GL_NEAREST : GL_LINEAR;
+        for (int k = 0; k < PSETS; k++) {
+            for (int i = 0; i < 2; i++) {
+                glBindTexture(GL_TEXTURE_2D, g_pset_tex[k][i]);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+            }
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        glViewport(ctremu.screens[i].x, ctremu.windowH - ctremu.screens[i].y - ctremu.screens[i].h,
+                   ctremu.screens[i].w, ctremu.screens[i].h);
+        glBindTexture(GL_TEXTURE_2D, g_pset_tex[sets[i]][i]);
+        if (ctremu.screens[i].w && gpu_gl_screen_pass && gpu_gl_screen_pass(i)) {
+            glUseProgram(state->main_program);
+            glBindVertexArray(vao);
+            continue;
+        }
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+}
+
+void gpu_gl_present_done(const int sets[2]) {
+    GLsync f = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    for (int i = 0; i < 2; i++) {
+        int s = sets[i];
+        if (i == 1 && sets[1] == sets[0]) break;
+        if (g_pset_done[s]) glDeleteSync(g_pset_done[s]);
+        // one fence object per set: a second set gets its own
+        g_pset_done[s] = i == 0 ? f : glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+    glFlush();
 }
 
 void renderer_gl_update_freecam(GLState* state) {
@@ -877,29 +1109,52 @@ void savestate_put(void* ss, const void* p, size_t n);
 bool savestate_get(void* ss, void* p, size_t n);
 
 // with the renderer stopped; the rest of a state is then written on its own thread
+// The pictures for a save state: fields one by one, as the rest of the state.
+#define FB_FIELDS 42 // bytes each framebuffer's fields take
+#define BLOB_PUT(v)                                                            \
+    ({                                                                         \
+        auto v_ = (v);                                                         \
+        memcpy(p, &v_, sizeof v_);                                             \
+        p += sizeof v_;                                                        \
+    })
+#define BLOB_GET(T)                                                            \
+    ({                                                                         \
+        T v_;                                                                  \
+        memcpy(&v_, blob, sizeof v_);                                          \
+        blob += sizeof v_;                                                     \
+        v_;                                                                    \
+    })
+
 void* gpu_gl_fbs_capture(GPU* gpu, u64* size) {
     u32 count = 0;
-    u64 total = sizeof count + sizeof(u64);
+    u64 total = sizeof count + sizeof(u64) + sizeof(u32);
     for (int i = 0; i < FB_MAX; i++) {
         FBInfo* fb = &gpu->fbs.d[i];
         if (!fb->color_paddr || !fb->width) continue;
         count++;
-        total += offsetof(FBInfo, next) + (u64) fb->width * fb->height * ctremu.videoscale *
-                                              ctremu.videoscale * 4;
+        total += FB_FIELDS + (u64) fb->width * fb->height * ctremu.videoscale *
+                                 ctremu.videoscale * 4;
     }
-    u8* blob = malloc(total);
+    u8* blob = calloc(1, total); // the unused bytes after a framebuffer's fields stay zero
     u8* p = blob;
-    memcpy(p, &count, sizeof count);
-    p += sizeof count;
-    u64 cur = gpu->curfb ? gpu->curfb->color_paddr : 0;
-    memcpy(p, &cur, sizeof cur);
-    p += sizeof cur;
+    BLOB_PUT(count);
+    BLOB_PUT((u64) (gpu->curfb ? gpu->curfb->color_paddr : 0));
+    BLOB_PUT((u32) ctremu.videoscale);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     for (int i = 0; i < FB_MAX; i++) {
         FBInfo* fb = &gpu->fbs.d[i];
         if (!fb->color_paddr || !fb->width) continue;
-        memcpy(p, fb, offsetof(FBInfo, next));
-        p += offsetof(FBInfo, next);
+        u8* fields = p;
+        BLOB_PUT((u64) fb->color_paddr);
+        BLOB_PUT((u32) fb->depth_paddr);
+        BLOB_PUT((u32) fb->width);
+        BLOB_PUT((u32) fb->height);
+        BLOB_PUT((u32) fb->color_fmt);
+        BLOB_PUT((u32) fb->color_Bpp);
+        BLOB_PUT((u32) fb->depth_fmt);
+        BLOB_PUT((u8) fb->shadowMap);
+        BLOB_PUT((u8) fb->dirty);
+        p = fields + FB_FIELDS;
         u32 w = fb->width * ctremu.videoscale, h = fb->height * ctremu.videoscale;
         glBindFramebuffer(GL_FRAMEBUFFER, fb->fbo);
         glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, p);
@@ -958,23 +1213,30 @@ void gpu_gl_state_loaded(GPU* gpu, GPU* from, const u8* blob) {
     }
     gpu->curfb = &gpu->fbs.root;
 
-    u32 count = 0;
-    u64 cur = 0;
-    memcpy(&count, blob, sizeof count);
-    blob += sizeof count;
-    memcpy(&cur, blob, sizeof cur);
-    blob += sizeof cur;
+    u32 count = BLOB_GET(u32);
+    u64 cur = BLOB_GET(u64);
+    u32 scale = BLOB_GET(u32);
     for (u32 n = 0; n < count && n < FB_MAX; n++) {
-        FBInfo saved;
-        memcpy(&saved, blob, offsetof(FBInfo, next));
-        blob += offsetof(FBInfo, next);
-        FBInfo* fb = LRU_load(gpu->fbs, saved.color_paddr);
-        memcpy(fb, &saved, offsetof(FBInfo, next));
+        const u8* fields = blob;
+        u64 color_paddr = BLOB_GET(u64);
+        FBInfo* fb = LRU_load(gpu->fbs, color_paddr);
+        fb->color_paddr = color_paddr;
+        fb->depth_paddr = BLOB_GET(u32);
+        fb->width = BLOB_GET(u32);
+        fb->height = BLOB_GET(u32);
+        fb->color_fmt = BLOB_GET(u32);
+        fb->color_Bpp = BLOB_GET(u32);
+        fb->depth_fmt = BLOB_GET(u32);
+        fb->shadowMap = BLOB_GET(u8);
+        fb->dirty = BLOB_GET(u8);
+        blob = fields + FB_FIELDS;
         u32 w = fb->width * ctremu.videoscale, h = fb->height * ctremu.videoscale;
+        // saved at another resolution: the game draws the picture again on its next frame
+        bool same = scale == (u32) ctremu.videoscale;
         glBindFramebuffer(GL_FRAMEBUFFER, fb->fbo);
         glBindTexture(GL_TEXTURE_2D, fb->color_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, blob);
-        blob += w * h * 4;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, same ? blob : nullptr);
+        blob += (u64) fb->width * fb->height * scale * scale * 4;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
         glBindTexture(GL_TEXTURE_2D, fb->depth_tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, w, h, 0, GL_DEPTH_STENCIL,
@@ -1018,11 +1280,12 @@ void gpu_gl_display_transfer(GPU* gpu, u32 paddr, int yoffdst, bool scalex,
           screenid == SCREEN_TOP ? "top" : "bot");
 
     // scissor test and color mask affects blit framebuffer
+    gls_invalidate();
     glDisable(GL_SCISSOR_TEST);
     glColorMask(true, true, true, true);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb->fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu->gl.screenfbo[screenid]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, screen_target_fbo(gpu, screenid));
 
     int yoff = yoffsrc + yoffdst;
 
@@ -1066,11 +1329,12 @@ void gpu_gl_render_lcd_fb(GPU* gpu, u32 paddr, u32 fmt, int screenid) {
                  SCREEN_WIDTH(screenid), 0, glfmt, gltype, data);
 
     // scissor test and color mask affects blit framebuffer
+    gls_invalidate();
     glDisable(GL_SCISSOR_TEST);
     glColorMask(true, true, true, true);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, gpu->gl.swrenderfbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu->gl.screenfbo[screenid]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, screen_target_fbo(gpu, screenid));
 
     glBlitFramebuffer(0, 0, SCREEN_HEIGHT, SCREEN_WIDTH(screenid), 0,
                       SCREEN_WIDTH(screenid) * ctremu.videoscale,
@@ -1176,6 +1440,7 @@ static int tex_diff_update(GPU* gpu, TexInfo* tex, u32 lo, u32 hi) {
     const u8* guest = PTR(tex->paddr);
     u32 off = 0;
     int tiles = 0;
+    gls_textures_unknown(); // the uploads bind on the active unit
     for (int l = tex->minlod; l <= tex->maxlod; l++) {
         u32 lw = tex->width >> l, lh = tex->height >> l;
         u32 levelsize = lw * lh * (tex->fmt == 12 ? 4 : 8) / 8;
@@ -1186,28 +1451,36 @@ static int tex_diff_update(GPU* gpu, TexInfo* tex, u32 lo, u32 hi) {
             u32 end = hi < off + levelsize ? hi : off + levelsize;
             u32 ty1 = (end - off + rowbytes - 1) / rowbytes;
             if (ty1 > lh / 8) ty1 = lh / 8;
+            // the changed tiles' bounding box, uploaded once: each glTexSubImage costs about
+            // 0.13 ms here (Panfrost flushes the batch that reads the texture), the decode of a
+            // few extra tiles does not
+            u32 bx0 = ntx, bx1 = 0, by0 = lh / 8, by1 = 0;
             for (u32 ty = ty0; ty < ty1; ty++) {
                 u32 rowoff = off + ty * rowbytes;
                 const u8* g = guest + rowoff;
-                u8* s = tex->shadow + rowoff;
-                for (u32 tx = 0; tx < ntx;) {
-                    if (!memcmp(g + tx * tilebytes, s + tx * tilebytes, tilebytes)) {
-                        tx++;
-                        continue;
+                const u8* s = tex->shadow + rowoff;
+                if (!memcmp(g, s, rowbytes)) continue;
+                for (u32 tx = 0; tx < ntx; tx++) {
+                    if (memcmp(g + tx * tilebytes, s + tx * tilebytes, tilebytes)) {
+                        if (tx < bx0) bx0 = tx;
+                        if (tx + 1 > bx1) bx1 = tx + 1;
+                        if (ty < by0) by0 = ty;
+                        if (ty + 1 > by1) by1 = ty + 1;
                     }
-                    u32 run = 1;
-                    while (tx + run < ntx &&
-                           memcmp(g + (tx + run) * tilebytes, s + (tx + run) * tilebytes, tilebytes))
-                        run++;
-                    if (!tex_upload_tiles(tex, l, lh, tx, ty, run, 1, g + tx * tilebytes,
-                                          run * tilebytes, rowbytes)) {
-                        g_ns_texdiff += diag_now() - t0;
-                        return -1;
-                    }
-                    memcpy(s + tx * tilebytes, g + tx * tilebytes, run * tilebytes);
-                    tiles += run;
-                    tx += run;
                 }
+            }
+            if (bx1 > bx0) {
+                u32 tw = bx1 - bx0, th = by1 - by0;
+                const u8* g = guest + off + by0 * rowbytes + bx0 * tilebytes;
+                if (!tex_upload_tiles(tex, l, lh, bx0, by0, tw, th, g, tw * tilebytes, rowbytes)) {
+                    g_ns_texdiff += diag_now() - t0;
+                    return -1;
+                }
+                for (u32 ty = by0; ty < by1; ty++) {
+                    u32 o = off + ty * rowbytes + bx0 * tilebytes;
+                    memcpy(tex->shadow + o, guest + o, tw * tilebytes);
+                }
+                tiles += tw * th;
             }
         }
         off += levelsize;
@@ -1217,6 +1490,17 @@ static int tex_diff_update(GPU* gpu, TexInfo* tex, u32 lo, u32 hi) {
     g_ns_texdiff_all += dt;
     g_tex_diffs_all++;
     g_tex_difftiles_all += tiles;
+    static int check = -1;
+    if (check < 0) check = getenv("SPIKE_DIFFCHECK") != nullptr;
+    if (check && memcmp(tex->shadow, guest, tex->size)) {
+        u32 first = 0;
+        while (first < tex->size && tex->shadow[first] == guest[first]) first++;
+        spike_logf("diffcheck: texture %08x fmt %d %dx%d still differs at byte %u after a diff "
+                   "of %u..%u (%d tiles)\n",
+                   tex->paddr, tex->fmt, tex->width, tex->height, first, lo, hi, tiles);
+        memcpy(tex->shadow, guest, tex->size);
+        return -1;
+    }
     return tiles;
 }
 
@@ -1253,6 +1537,7 @@ static bool tex_partial_update(GPU* gpu, TexInfo* tex, u32 dstpaddr, u32 size,
         }
         u8* row = PTR(dstpaddr);
         glBindTexture(GL_TEXTURE_2D, tex->tex);
+        gls_textures_unknown();
         if (!tex_upload_tiles(tex, l, lh, tx, ty, tw, th, row, pitch, rowbytes)) {
             g_partial_fail[2]++;
             return false;
@@ -1311,6 +1596,7 @@ void gpu_gl_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
 
             glBindFramebuffer(GL_READ_FRAMEBUFFER, srcfb->fbo);
             glBindTexture(GL_TEXTURE_2D, dsttex->tex);
+            gls_textures_unknown();
             dsttex->etcnative = false;
             tex_shadow_drop(dsttex);
             glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0,
@@ -1335,6 +1621,7 @@ void gpu_gl_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
 
     u8* src = PTR(srcpaddr);
     u8* dst = PTR(dstpaddr);
+    u8* dst0 = dst;
 
     int cnt = 0;
     int curline = 0;
@@ -1371,12 +1658,16 @@ void gpu_gl_texture_copy(GPU* gpu, u32 srcpaddr, u32 dstpaddr, u32 size,
     if (!dsttex) g_partial_fail[3]++;
     else if (srcpitch != dstpitch) g_partial_fail[0]++;
 
-    gpu_invalidate_range(gpu, dstpaddr, size);
+    // the written span is longer than size when the destination has gaps; the tile diff
+    // compares only what is marked, so mark all of it (coins from blocks drew wrong without)
+    u32 written = dst - dst0;
+    gpu_invalidate_range(gpu, dstpaddr, written > size ? written : size);
 }
 
 void gpu_gl_clear_fb(GPU* gpu, u32 paddr, u32 endPaddr, u32 value, u32 datasz) {
     // some of the current gl state can affect gl clear
     // so we need to reset it
+    gls_invalidate();
     glDisable(GL_SCISSOR_TEST);
     glColorMask(true, true, true, true);
     glDepthMask(true);
@@ -1706,7 +1997,7 @@ void load_tex_image(void* rawdata, int w, int h, int level, int fmt) {
     }
 }
 
-int g_tex_creates, g_tex_partial, g_draws, g_tex_same, g_tex_changed, g_tex_again;
+int g_tex_creates, g_tex_partial, g_draws, g_tex_same, g_tex_changed, g_tex_again, g_draws_lit;
 // spike: where texture time goes, printed at exit
 struct { int n; u64 pixels, ns, ns_sync, ns_max; } g_texstat[16];
 void gpu_gl_print_texstat() {
@@ -1814,23 +2105,237 @@ static void create_texture_real(GPU* gpu, TexInfo* tex, TexUnitRegs* regs) {
     }
 }
 
+
+// ---- spike: GL state cache for the draw path ----
+// Every GL call is marshalled to Mesa's driver thread and unmarshalled there, about 40 a
+// draw, most of them setting what is already set. The draw path goes through these setters,
+// which skip a call when the value is the one last sent. Anything else that touches the same
+// state on this context invalidates the cache (frame start, transfers, clears, uploads).
+#define GLS_CAPS 8
+static const GLenum gls_capv[GLS_CAPS] = {GL_CULL_FACE,    GL_SCISSOR_TEST, GL_DEPTH_TEST,
+                                          GL_BLEND,        GL_COLOR_LOGIC_OP, GL_STENCIL_TEST,
+                                          GL_POLYGON_OFFSET_FILL, GL_DITHER};
+static struct {
+    u8 cap[GLS_CAPS]; // 0 off, 1 on, 2 unknown
+    bool cull_k, vp_k, sc_k, cmask_k, dmask_k, dfunc_k, blendf_k, blende_k, blendc_k, logic_k,
+        sfunc_k, sop_k, smask_k, vao_k, abuf_k, ebuf_k, active_k;
+    GLenum cull, dfunc, logic, bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a, sfunc, sop[3];
+    GLint vp[4], sc[4], sref;
+    GLuint smaskv, swmask, vao, abuf, ebuf;
+    GLboolean cmask[4], dmask;
+    float bcol[4];
+    int active;
+    struct { GLenum target; GLuint name; bool k; } unit[8];
+    struct { GLint size; GLenum type; GLsizei stride; const void* ptr; GLuint buf; bool k; u8 en; } attr[16];
+    struct { GLuint buf; GLintptr off; GLsizeiptr size; bool k; } ubo[4];
+    bool on;
+} g_gls;
+int g_gls_skipped, g_gls_calls;
+
+static void vab_invalidate(void);
+static void gls_invalidate(void) {
+    memset(&g_gls, 0, sizeof g_gls);
+    vab_invalidate();
+    for (int i = 0; i < GLS_CAPS; i++) g_gls.cap[i] = 2;
+    for (int i = 0; i < 16; i++) g_gls.attr[i].en = 2;
+    static int on = -1;
+    if (on < 0) on = !getenv("SPIKE_NOGLCACHE");
+    g_gls.on = on;
+}
+static void gls_textures_unknown(void) {
+    for (int i = 0; i < 8; i++) g_gls.unit[i].k = false;
+    g_gls.active_k = false;
+}
+static inline int gls_capi(GLenum cap) {
+    for (int i = 0; i < GLS_CAPS; i++) if (gls_capv[i] == cap) return i;
+    return -1;
+}
+static inline void gls_Enable(GLenum cap) {
+    int i = gls_capi(cap);
+    g_gls_calls++;
+    if (g_gls.on && i >= 0 && g_gls.cap[i] == 1) { g_gls_skipped++; return; }
+    glEnable(cap);
+    if (i >= 0) g_gls.cap[i] = 1;
+}
+static inline void gls_Disable(GLenum cap) {
+    int i = gls_capi(cap);
+    g_gls_calls++;
+    if (g_gls.on && i >= 0 && g_gls.cap[i] == 0) { g_gls_skipped++; return; }
+    glDisable(cap);
+    if (i >= 0) g_gls.cap[i] = 0;
+}
+#define GLS_SET1(name, field, kfield, call)                                            \
+    g_gls_calls++;                                                                      \
+    if (g_gls.on && g_gls.kfield && g_gls.field == (name)) { g_gls_skipped++; return; } \
+    call;                                                                               \
+    g_gls.field = (name);                                                               \
+    g_gls.kfield = true;
+static inline void gls_CullFace(GLenum m) { GLS_SET1(m, cull, cull_k, glCullFace(m)) }
+static inline void gls_DepthFunc(GLenum f) { GLS_SET1(f, dfunc, dfunc_k, glDepthFunc(f)) }
+static inline void gls_LogicOp(GLenum f) { GLS_SET1(f, logic, logic_k, glLogicOp(f)) }
+static inline void gls_DepthMask(GLboolean b) { GLS_SET1(b, dmask, dmask_k, glDepthMask(b)) }
+static inline void gls_StencilMask(GLuint m) { GLS_SET1(m, swmask, smask_k, glStencilMask(m)) }
+static inline void gls_BindVertexArray(GLuint v) {
+    g_gls_calls++;
+    if (g_gls.on && g_gls.vao_k && g_gls.vao == v) { g_gls_skipped++; return; }
+    glBindVertexArray(v);
+    g_gls.vao = v;
+    g_gls.vao_k = true;
+    // the element buffer binding and the attribute arrays belong to the vertex array object
+    g_gls.ebuf_k = false;
+    for (int i = 0; i < 16; i++) { g_gls.attr[i].k = false; g_gls.attr[i].en = 2; }
+    vab_invalidate();
+}
+static inline void gls_Viewport(GLint x, GLint y, GLint w, GLint h) {
+    GLint v[4] = {x, y, w, h};
+    g_gls_calls++;
+    if (g_gls.on && g_gls.vp_k && !memcmp(v, g_gls.vp, sizeof v)) { g_gls_skipped++; return; }
+    glViewport(x, y, w, h);
+    memcpy(g_gls.vp, v, sizeof v);
+    g_gls.vp_k = true;
+}
+static inline void gls_Scissor(GLint x, GLint y, GLint w, GLint h) {
+    GLint v[4] = {x, y, w, h};
+    g_gls_calls++;
+    if (g_gls.on && g_gls.sc_k && !memcmp(v, g_gls.sc, sizeof v)) { g_gls_skipped++; return; }
+    glScissor(x, y, w, h);
+    memcpy(g_gls.sc, v, sizeof v);
+    g_gls.sc_k = true;
+}
+static inline void gls_ColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    GLboolean v[4] = {r, g, b, a};
+    g_gls_calls++;
+    if (g_gls.on && g_gls.cmask_k && !memcmp(v, g_gls.cmask, sizeof v)) { g_gls_skipped++; return; }
+    glColorMask(r, g, b, a);
+    memcpy(g_gls.cmask, v, sizeof v);
+    g_gls.cmask_k = true;
+}
+static inline void gls_BlendFuncSeparate(GLenum a, GLenum b, GLenum c, GLenum d) {
+    g_gls_calls++;
+    if (g_gls.on && g_gls.blendf_k && g_gls.bsrc_rgb == a && g_gls.bdst_rgb == b && g_gls.bsrc_a == c &&
+        g_gls.bdst_a == d) { g_gls_skipped++; return; }
+    glBlendFuncSeparate(a, b, c, d);
+    g_gls.bsrc_rgb = a; g_gls.bdst_rgb = b; g_gls.bsrc_a = c; g_gls.bdst_a = d;
+    g_gls.blendf_k = true;
+}
+static inline void gls_BlendEquationSeparate(GLenum a, GLenum b) {
+    g_gls_calls++;
+    if (g_gls.on && g_gls.blende_k && g_gls.beq_rgb == a && g_gls.beq_a == b) { g_gls_skipped++; return; }
+    glBlendEquationSeparate(a, b);
+    g_gls.beq_rgb = a; g_gls.beq_a = b;
+    g_gls.blende_k = true;
+}
+static inline void gls_BlendColor(float r, float g, float b, float a) {
+    float v[4] = {r, g, b, a};
+    g_gls_calls++;
+    if (g_gls.on && g_gls.blendc_k && !memcmp(v, g_gls.bcol, sizeof v)) { g_gls_skipped++; return; }
+    glBlendColor(r, g, b, a);
+    memcpy(g_gls.bcol, v, sizeof v);
+    g_gls.blendc_k = true;
+}
+static inline void gls_StencilFunc(GLenum f, GLint ref, GLuint mask) {
+    g_gls_calls++;
+    if (g_gls.on && g_gls.sfunc_k && g_gls.sfunc == f && g_gls.sref == ref && g_gls.smaskv == mask) { g_gls_skipped++; return; }
+    glStencilFunc(f, ref, mask);
+    g_gls.sfunc = f; g_gls.sref = ref; g_gls.smaskv = mask;
+    g_gls.sfunc_k = true;
+}
+static inline void gls_StencilOp(GLenum a, GLenum b, GLenum c) {
+    g_gls_calls++;
+    if (g_gls.on && g_gls.sop_k && g_gls.sop[0] == a && g_gls.sop[1] == b && g_gls.sop[2] == c) { g_gls_skipped++; return; }
+    glStencilOp(a, b, c);
+    g_gls.sop[0] = a; g_gls.sop[1] = b; g_gls.sop[2] = c;
+    g_gls.sop_k = true;
+}
+static inline void gls_ActiveTexture(GLenum u) {
+    int i = u - GL_TEXTURE0;
+    g_gls_calls++;
+    if (g_gls.on && g_gls.active_k && g_gls.active == i) { g_gls_skipped++; return; }
+    glActiveTexture(u);
+    g_gls.active = i;
+    g_gls.active_k = true;
+}
+static inline void gls_BindTexture(GLenum target, GLuint name) {
+    int i = g_gls.active_k ? g_gls.active : -1;
+    g_gls_calls++;
+    if (g_gls.on && i >= 0 && i < 8 && g_gls.unit[i].k && g_gls.unit[i].target == target &&
+        g_gls.unit[i].name == name) { g_gls_skipped++; return; }
+    glBindTexture(target, name);
+    if (i >= 0 && i < 8) {
+        g_gls.unit[i].target = target;
+        g_gls.unit[i].name = name;
+        g_gls.unit[i].k = true;
+    }
+}
+static inline void gls_BindBuffer(GLenum target, GLuint b) {
+    if (target == GL_ARRAY_BUFFER) { GLS_SET1(b, abuf, abuf_k, glBindBuffer(target, b)) }
+    else if (target == GL_ELEMENT_ARRAY_BUFFER) { GLS_SET1(b, ebuf, ebuf_k, glBindBuffer(target, b)) }
+    else glBindBuffer(target, b);
+}
+static inline void gls_BindBufferRange(GLenum target, GLuint idx, GLuint b, GLintptr off, GLsizeiptr size) {
+    g_gls_calls++;
+    if (target == GL_UNIFORM_BUFFER && idx < 4) {
+        if (g_gls.on && g_gls.ubo[idx].k && g_gls.ubo[idx].buf == b && g_gls.ubo[idx].off == off &&
+            g_gls.ubo[idx].size == size) { g_gls_skipped++; return; }
+        g_gls.ubo[idx].buf = b; g_gls.ubo[idx].off = off; g_gls.ubo[idx].size = size;
+        g_gls.ubo[idx].k = true;
+    }
+    glBindBufferRange(target, idx, b, off, size);
+}
+static inline void gls_EnableVertexAttribArray(GLuint a) {
+    g_gls_calls++;
+    if (g_gls.on && a < 16 && g_gls.attr[a].en == 1) { g_gls_skipped++; return; }
+    glEnableVertexAttribArray(a);
+    if (a < 16) g_gls.attr[a].en = 1;
+}
+static inline void gls_DisableVertexAttribArray(GLuint a) {
+    g_gls_calls++;
+    if (g_gls.on && a < 16 && g_gls.attr[a].en == 0) { g_gls_skipped++; return; }
+    glDisableVertexAttribArray(a);
+    if (a < 16) g_gls.attr[a].en = 0;
+}
+static inline void gls_VertexAttribPointer(GLuint a, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void* ptr) {
+    g_gls_calls++;
+    GLuint buf = g_gls.abuf_k ? g_gls.abuf : 0xffffffffu;
+    if (g_gls.on && a < 16 && g_gls.attr[a].k && g_gls.attr[a].size == size && g_gls.attr[a].type == type &&
+        g_gls.attr[a].stride == stride && g_gls.attr[a].ptr == ptr && g_gls.attr[a].buf == buf) { g_gls_skipped++; return; }
+    glVertexAttribPointer(a, size, type, norm, stride, ptr);
+    if (a < 16) {
+        g_gls.attr[a].size = size; g_gls.attr[a].type = type; g_gls.attr[a].stride = stride;
+        g_gls.attr[a].ptr = ptr; g_gls.attr[a].buf = buf; g_gls.attr[a].k = true;
+    }
+}
+// ---- end of the state cache ----
+
 static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
                          u32 fmt) {
     // make sure we are binding to the correct texture
-    glActiveTexture(GL_TEXTURE0 + id);
+    gls_ActiveTexture(GL_TEXTURE0 + id);
 
     // since null is empty for the caches we need to handle
     // null address before searching any cache
     if (regs->addr == 0) {
         lwarnonce("null texture");
-        glBindTexture(GL_TEXTURE_2D, gpu->gl.blanktex);
+        gls_BindTexture(GL_TEXTURE_2D, gpu->gl.blanktex);
         return;
     }
 
     u32 texsize = texsize_total(regs, fmt);
 
-    auto tex = LRU_load(gpu->textures, regs->addr << 3);
-    glBindTexture(GL_TEXTURE_2D, tex->tex);
+    // spike: the cache is a list searched from the front, 256 entries long, and every draw looks
+    // its textures up (a twelfth of this thread in Mario Kart 7): a hint by address first
+    static u16 hint[4096];
+    u64 key = regs->addr << 3;
+    u32 h = (u32) (key >> 3) * 2654435761u >> 20;
+    TexInfo* tex;
+    if (hint[h] && gpu->textures.d[hint[h] - 1].key == key) {
+        tex = &gpu->textures.d[hint[h] - 1];
+        LRU_use(gpu->textures, tex);
+    } else {
+        tex = LRU_load(gpu->textures, key);
+        hint[h] = tex - gpu->textures.d + 1;
+    }
+    gls_BindTexture(GL_TEXTURE_2D, tex->tex);
 
     // textures that are partially out of bounds can still be used with rtt ..?
     if (is_valid_physmem(regs->addr << 3) &&
@@ -1867,6 +2372,13 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
             tex->stale = false;
             u32 lo = tex->dirty_lo, hi = tex->dirty_hi;
             tex->dirty_lo = tex->dirty_hi = 0;
+            // the game also writes textures with no flush at all (coins from blocks in NSMB2), and
+            // HashTextures is off, so once a frame the whole texture is compared, not just the range
+            if (tex->shadow && tex->checked_frame != g_tex_frame) {
+                tex->checked_frame = g_tex_frame;
+                lo = 0;
+                hi = tex->size;
+            }
             int r = tex_diff_update(gpu, tex, lo, hi);
             if (r > 0) {
                 g_tex_diffs++;
@@ -1961,7 +2473,7 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
         fb->dirty = false;
         linfo("rtt at %08x", fb->color_paddr);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fb->fbo);
-        glBindTexture(GL_TEXTURE_2D, tex->tex);
+        gls_BindTexture(GL_TEXTURE_2D, tex->tex);
         // no swizzling or mipmaps for rtt textures
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
         glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA,
@@ -1999,20 +2511,20 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
             // part of a texture except for reading back the raw data
             // this is pretty slow so its a setting
             if (ctremu.reinterpretTexture) {
-                glBindBuffer(GL_PIXEL_PACK_BUFFER, gpu->gl.pbo);
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gpu->gl.pbo);
+                gls_BindBuffer(GL_PIXEL_PACK_BUFFER, gpu->gl.pbo);
+                gls_BindBuffer(GL_PIXEL_UNPACK_BUFFER, gpu->gl.pbo);
 
-                glBindTexture(GL_TEXTURE_2D, fb->depth_tex);
+                gls_BindTexture(GL_TEXTURE_2D, fb->depth_tex);
                 glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_STENCIL,
                               GL_UNSIGNED_INT_24_8, nullptr);
-                glBindTexture(GL_TEXTURE_2D, tex->tex);
+                gls_BindTexture(GL_TEXTURE_2D, tex->tex);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
                              tex->width * ctremu.videoscale,
                              tex->height * ctremu.videoscale, 0, GL_RGBA,
                              GL_UNSIGNED_INT_8_8_8_8_REV, nullptr);
 
-                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                gls_BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                gls_BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
                 glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA,
                                  texswizzle_d24s8);
             }
@@ -2100,41 +2612,95 @@ static void setup_fixattrs_hw(GPU* gpu) {
                 memcpy(current[attr], gpu->fixattrs[i], sizeof current[0]);
                 glVertexAttrib4fv(attr, gpu->fixattrs[i]);
             }
-            glDisableVertexAttribArray(attr);
+            gls_DisableVertexAttribArray(attr);
         }
     }
 }
 
-static void setup_hw_vao(GPU* gpu, DrawSnap* snap) {
+// spike: with ARB_vertex_attrib_binding the vertex data's place in the ring is one
+// glBindVertexBuffer per buffer a draw, and the attribute formats (set per attribute, and the
+// same from draw to draw) are sent only when they change. Measured 2026-11-03 with the
+// extension forced on (MESA_EXTENSION_OVERRIDE=+GL_ARB_vertex_attrib_binding): fewer calls
+// (7.3 against 7.8 a draw) but the driver thread busier (60% against 45%) and more frames
+// lost, so it is opt-in: SPIKE_ATTRIBBINDING=1. Without it, glVertexAttribPointer per attribute.
+static int g_vab = -1;
+static struct { GLint size; GLenum type; GLuint reloff, binding; bool k; } g_vab_fmt[16];
+static struct { GLintptr off; GLsizei stride; GLuint buf; bool k; } g_vab_buf[12];
+static void vab_invalidate(void) {
+    memset(g_vab_fmt, 0, sizeof g_vab_fmt);
+    memset(g_vab_buf, 0, sizeof g_vab_buf);
+}
+// draws whose vertex buffers the main thread laid out for the driver (VboLayout in
+// renderer_gl.h): `relaid` in the stats line
+int g_draws_relaid;
+
+static void setup_hw_vao(GPU* gpu, DrawSnap* snap, int nbufverts) {
     setup_fixattrs_hw(gpu);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vstream);
+    if (g_vab < 0) {
+        // the loader only knows it as part of GL 4.3, which the 3.3 override hides: ask by name
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        bool ext = false;
+        for (GLint i = 0; i < n && !ext; i++) {
+            const char* e = (const char*) glGetStringi(GL_EXTENSIONS, i);
+            ext = e && !strcmp(e, "GL_ARB_vertex_attrib_binding");
+        }
+        g_vab = ext && glad_glBindVertexBuffer && glad_glVertexAttribFormat &&
+                glad_glVertexAttribBinding && getenv("SPIKE_ATTRIBBINDING");
+        fprintf(stderr, "spike vertex attrib binding: %s\n", g_vab ? "on" : "off");
+    }
+    if (g_vab) {
+        for (int vbo = 0; vbo < 12; vbo++) {
+            if (gpu->regs.geom.attrbuf[vbo].count == 0) continue;
+            VboLayout lay;
+            gpu_vbo_layout(&gpu->regs, vbo, &lay);
+            for (int i = 0; i < lay.n; i++) {
+                int permattr = (gpu->regs.vsh.permutation >> 4 * lay.a[i].attr) & 0xf;
+                typeof(&g_vab_fmt[0]) f = &g_vab_fmt[permattr];
+                g_gls_calls += 2;
+                if (!f->k || f->size != lay.a[i].size || f->type != attrtypes[lay.a[i].type] ||
+                    f->reloff != lay.a[i].off || f->binding != (GLuint) vbo) {
+                    glVertexAttribFormat(permattr, lay.a[i].size, attrtypes[lay.a[i].type], GL_FALSE,
+                                         lay.a[i].off);
+                    glVertexAttribBinding(permattr, vbo);
+                    f->size = lay.a[i].size;
+                    f->type = attrtypes[lay.a[i].type];
+                    f->reloff = lay.a[i].off;
+                    f->binding = vbo;
+                    f->k = true;
+                } else {
+                    g_gls_skipped += 2;
+                }
+                gls_EnableVertexAttribArray(permattr);
+            }
+            typeof(&g_vab_buf[0]) b = &g_vab_buf[vbo];
+            g_gls_calls++;
+            if (!b->k || b->off != (GLintptr) snap->vbo[vbo] || b->stride != (GLsizei) lay.stride ||
+                b->buf != g_vstream) {
+                glBindVertexBuffer(vbo, g_vstream, snap->vbo[vbo], lay.stride);
+                b->off = snap->vbo[vbo];
+                b->stride = lay.stride;
+                b->buf = g_vstream;
+                b->k = true;
+            } else {
+                g_gls_skipped++;
+            }
+        }
+        return;
+    }
+    gls_BindBuffer(GL_ARRAY_BUFFER, g_vstream);
 
     for (int vbo = 0; vbo < 12; vbo++) {
         // skip unused vbos
         if (gpu->regs.geom.attrbuf[vbo].count == 0) continue;
-
-        u32 stride = gpu->regs.geom.attrbuf[vbo].size;
-        void* off = (void*) (size_t) snap->vbo[vbo];
-
-        for (int c = 0; c < gpu->regs.geom.attrbuf[vbo].count; c++) {
-            int attr = (gpu->regs.geom.attrbuf[vbo].comp >> 4 * c) & 0xf;
-            if (attr >= 0xc) {
-                off += 4 * (attr - 0xb);
-                continue;
-            }
-            int fmt = (gpu->regs.geom.attr_format >> 4 * attr) & 0xf;
-
-            int size = (fmt >> 2) + 1;
-            int type = fmt & 3;
-
-            int permattr = (gpu->regs.vsh.permutation >> 4 * attr) & 0xf;
-
-            glVertexAttribPointer(permattr, size, attrtypes[type], GL_FALSE,
-                                  stride, off);
-            glEnableVertexAttribArray(permattr);
-
-            static const int typesize[4] = {1, 1, 2, 4};
-            off += size * typesize[type];
+        // the layout the main thread copied this buffer in (VboLayout)
+        VboLayout lay;
+        gpu_vbo_layout(&gpu->regs, vbo, &lay);
+        for (int i = 0; i < lay.n; i++) {
+            int permattr = (gpu->regs.vsh.permutation >> 4 * lay.a[i].attr) & 0xf;
+            gls_VertexAttribPointer(permattr, lay.a[i].size, attrtypes[lay.a[i].type], GL_FALSE,
+                                  lay.stride, (void*) (size_t) (snap->vbo[vbo] + lay.a[i].off));
+            gls_EnableVertexAttribArray(permattr);
         }
     }
 }
@@ -2148,10 +2714,10 @@ static void setup_hw_vao_imm(GPU* gpu) {
                              gpu->immattrs.size * sizeof(fvec4), 16);
     for (int i = 0; i < nattrs; i++) {
         int attr = (gpu->regs.vsh.permutation >> 4 * i) & 0xf;
-        glVertexAttribPointer(attr, 4, GL_FLOAT, GL_FALSE,
+        gls_VertexAttribPointer(attr, 4, GL_FLOAT, GL_FALSE,
                               nattrs * sizeof(fvec4),
                               (void*) (base + i * sizeof(fvec4)));
-        glEnableVertexAttribArray(attr);
+        gls_EnableVertexAttribArray(attr);
     }
 }
 
@@ -2184,19 +2750,19 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     // cull mode
     switch (gpu->regs.raster.cullmode) {
         case 0:
-            glDisable(GL_CULL_FACE);
+            gls_Disable(GL_CULL_FACE);
             break;
         case 1:
-            glEnable(GL_CULL_FACE);
-            glCullFace(GL_FRONT);
+            gls_Enable(GL_CULL_FACE);
+            gls_CullFace(GL_FRONT);
             break;
         case 2:
-            glEnable(GL_CULL_FACE);
-            glCullFace(GL_BACK);
+            gls_Enable(GL_CULL_FACE);
+            gls_CullFace(GL_BACK);
             break;
         case 3:
-            glEnable(GL_CULL_FACE);
-            glCullFace(GL_FRONT_AND_BACK);
+            gls_Enable(GL_CULL_FACE);
+            gls_CullFace(GL_FRONT_AND_BACK);
             break;
     }
 
@@ -2204,13 +2770,13 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     // since the framebuffer texture may be taller than the current framebuffer,
     // we need to offset the Y value
     int vyoff = gpu->curfb->height - (gpu->regs.fb.dim.height + 1);
-    glViewport(gpu->regs.raster.view_x * ctremu.videoscale,
+    gls_Viewport(gpu->regs.raster.view_x * ctremu.videoscale,
                (gpu->regs.raster.view_y + vyoff) * ctremu.videoscale,
                2 * cvtf24(gpu->regs.raster.view_w) * ctremu.videoscale,
                2 * cvtf24(gpu->regs.raster.view_h) * ctremu.videoscale);
     if (gpu->regs.raster.scissortest.enable) {
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(gpu->regs.raster.scissortest.x1 * ctremu.videoscale,
+        gls_Enable(GL_SCISSOR_TEST);
+        gls_Scissor(gpu->regs.raster.scissortest.x1 * ctremu.videoscale,
                   (gpu->regs.raster.scissortest.y1 + vyoff) * ctremu.videoscale,
                   (gpu->regs.raster.scissortest.x2 + 1 -
                    gpu->regs.raster.scissortest.x1) *
@@ -2219,7 +2785,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
                    gpu->regs.raster.scissortest.y1) *
                       ctremu.videoscale);
     } else {
-        glDisable(GL_SCISSOR_TEST);
+        gls_Disable(GL_SCISSOR_TEST);
     }
 
     // depth map
@@ -2251,8 +2817,8 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     }
 
     if (gpu->regs.tex.config.tex3enable) {
-        glActiveTexture(GL_TEXTURE3);
-        glBindTexture(GL_TEXTURE_1D, gpu->proctex.tex);
+        gls_ActiveTexture(GL_TEXTURE3);
+        gls_BindTexture(GL_TEXTURE_1D, gpu->proctex.tex);
         if (gpu->proctexLutDirty ||
             gpu->proctex.width != gpu->regs.tex.tex3.paramH.width ||
             gpu->proctex.offset != gpu->regs.tex.tex3.offset[0]) {
@@ -2269,15 +2835,15 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
                         proctexfilter[gpu->regs.tex.tex3.paramH.minFilter]);
         fcfg.proctex.w = gpu->regs.tex.tex3.paramL.w;
 
-        glActiveTexture(GL_TEXTURE6);
-        glBindTexture(GL_TEXTURE_1D, gpu->gl.proctexmaptex);
+        gls_ActiveTexture(GL_TEXTURE6);
+        gls_BindTexture(GL_TEXTURE_1D, gpu->gl.proctexmaptex);
         if (gpu->proctexMapLutDirty) {
             gpu->proctexMapLutDirty = false;
             glTexSubImage1D(GL_TEXTURE_1D, 0, 0, countof(gpu->proctexMapLut),
                             GL_RG, GL_UNSIGNED_SHORT, gpu->proctexMapLut);
         }
-        glActiveTexture(GL_TEXTURE7);
-        glBindTexture(GL_TEXTURE_1D, gpu->gl.proctexnoisetex);
+        gls_ActiveTexture(GL_TEXTURE7);
+        gls_BindTexture(GL_TEXTURE_1D, gpu->gl.proctexnoisetex);
         if (gpu->proctexNoiseLutDirty) {
             gpu->proctexNoiseLutDirty = false;
             glTexSubImage1D(GL_TEXTURE_1D, 0, 0, countof(gpu->proctexNoiseLut),
@@ -2307,22 +2873,22 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     // blending/logic ops
     fcfg.fragOp = gpu->regs.fb.color_op.frag_mode;
     if (gpu->regs.fb.color_op.blend_mode) {
-        glDisable(GL_COLOR_LOGIC_OP);
-        glEnable(GL_BLEND);
-        glBlendEquationSeparate(blend_eq[gpu->regs.fb.blend_func.rgb_eq],
+        gls_Disable(GL_COLOR_LOGIC_OP);
+        gls_Enable(GL_BLEND);
+        gls_BlendEquationSeparate(blend_eq[gpu->regs.fb.blend_func.rgb_eq],
                                 blend_eq[gpu->regs.fb.blend_func.a_eq]);
-        glBlendFuncSeparate(blend_func[gpu->regs.fb.blend_func.rgb_src],
+        gls_BlendFuncSeparate(blend_func[gpu->regs.fb.blend_func.rgb_src],
                             blend_func[gpu->regs.fb.blend_func.rgb_dst],
                             blend_func[gpu->regs.fb.blend_func.a_src],
                             blend_func[gpu->regs.fb.blend_func.a_dst]);
-        glBlendColor(gpu->regs.fb.blend_color.r / 255.f,
+        gls_BlendColor(gpu->regs.fb.blend_color.r / 255.f,
                      gpu->regs.fb.blend_color.g / 255.f,
                      gpu->regs.fb.blend_color.b / 255.f,
                      gpu->regs.fb.blend_color.a / 255.f);
     } else {
-        glDisable(GL_BLEND);
-        glEnable(GL_COLOR_LOGIC_OP);
-        glLogicOp(logic_ops[gpu->regs.fb.logic_op]);
+        gls_Disable(GL_BLEND);
+        gls_Enable(GL_COLOR_LOGIC_OP);
+        gls_LogicOp(logic_ops[gpu->regs.fb.logic_op]);
     }
 
     // alpha test
@@ -2334,46 +2900,46 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
 
     // stencil test
     if (gpu->regs.fb.stencil_test.enable) {
-        glEnable(GL_STENCIL_TEST);
+        gls_Enable(GL_STENCIL_TEST);
         if (gpu->regs.fb.perms.depthbuf.write) {
-            glStencilMask(gpu->regs.fb.stencil_test.bufmask);
+            gls_StencilMask(gpu->regs.fb.stencil_test.bufmask);
         } else {
-            glStencilMask(0);
+            gls_StencilMask(0);
         }
-        glStencilFunc(compare_func[gpu->regs.fb.stencil_test.func],
+        gls_StencilFunc(compare_func[gpu->regs.fb.stencil_test.func],
                       gpu->regs.fb.stencil_test.ref,
                       gpu->regs.fb.stencil_test.mask);
-        glStencilOp(stencil_op[gpu->regs.fb.stencil_op.fail],
+        gls_StencilOp(stencil_op[gpu->regs.fb.stencil_op.fail],
                     stencil_op[gpu->regs.fb.stencil_op.zfail],
                     stencil_op[gpu->regs.fb.stencil_op.zpass]);
     } else {
-        glDisable(GL_STENCIL_TEST);
+        gls_Disable(GL_STENCIL_TEST);
     }
 
     // color mask and depth mask
     if (gpu->regs.fb.perms.colorbuf.write) {
-        glColorMask(gpu->regs.fb.color_mask.red, gpu->regs.fb.color_mask.green,
+        gls_ColorMask(gpu->regs.fb.color_mask.red, gpu->regs.fb.color_mask.green,
                     gpu->regs.fb.color_mask.blue,
                     gpu->regs.fb.color_mask.alpha);
     } else {
-        glColorMask(false, false, false, false);
+        gls_ColorMask(false, false, false, false);
     }
     // you can disable writing to the depth buffer with this register
     // instead of using the depth mask
     if (gpu->regs.fb.perms.depthbuf.write) {
-        glDepthMask(gpu->regs.fb.color_mask.depth);
+        gls_DepthMask(gpu->regs.fb.color_mask.depth);
     } else {
-        glDepthMask(false);
+        gls_DepthMask(false);
     }
 
     // depth test
     // we need to always enable the depth test, since the pica can still
     // write the depth buffer even if depth testing is disabled
-    glEnable(GL_DEPTH_TEST);
+    gls_Enable(GL_DEPTH_TEST);
     if (gpu->regs.fb.color_mask.depthtest) {
-        glDepthFunc(compare_func[gpu->regs.fb.color_mask.depthfunc]);
+        gls_DepthFunc(compare_func[gpu->regs.fb.color_mask.depthfunc]);
     } else {
-        glDepthFunc(GL_ALWAYS);
+        gls_DepthFunc(GL_ALWAYS);
     }
 
     // shadow map generation mode
@@ -2385,7 +2951,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     // framebuffer is cleared the depth is cleared as well
     if (gpu->regs.fb.color_op.frag_mode == 3) {
         gpu->curfb->shadowMap = true;
-        glDepthMask(true);
+        gls_DepthMask(true);
     } else {
         gpu->curfb->shadowMap = false;
     }
@@ -2425,7 +2991,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         fcfg.lightPerm = gpu->regs.lighting.permutation;
 
         // light luts, use slot 4
-        glActiveTexture(GL_TEXTURE4);
+        gls_ActiveTexture(GL_TEXTURE4);
         if (gpu->lightLutDirty) {
             gpu->lightLutDirty = false;
             // spike: writing a texture the current batch uses makes Panfrost copy or
@@ -2442,7 +3008,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
                 g_lut_misses++;
                 if (!g_lut[hit].tex) {
                     glGenTextures(1, &g_lut[hit].tex);
-                    glBindTexture(GL_TEXTURE_1D_ARRAY, g_lut[hit].tex);
+                    gls_BindTexture(GL_TEXTURE_1D_ARRAY, g_lut[hit].tex);
                     glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                     glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
                     glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2450,7 +3016,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
                                  countof(gpu->lightLuts), 0, GL_RED, GL_UNSIGNED_SHORT,
                                  gpu->lightLuts);
                 } else {
-                    glBindTexture(GL_TEXTURE_1D_ARRAY, g_lut[hit].tex);
+                    gls_BindTexture(GL_TEXTURE_1D_ARRAY, g_lut[hit].tex);
                     glTexSubImage2D(GL_TEXTURE_1D_ARRAY, 0, 0, 0,
                                     countof(gpu->lightLuts[0]), countof(gpu->lightLuts),
                                     GL_RED, GL_UNSIGNED_SHORT, gpu->lightLuts);
@@ -2460,12 +3026,12 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
             g_lut[hit].used = g_lut_tick;
             g_lut_cur = g_lut[hit].tex;
         }
-        glBindTexture(GL_TEXTURE_1D_ARRAY, g_lut_cur ? g_lut_cur : gpu->gl.lightluttex);
+        gls_BindTexture(GL_TEXTURE_1D_ARRAY, g_lut_cur ? g_lut_cur : gpu->gl.lightluttex);
     }
 
     // fog lut, use slot 5
-    glActiveTexture(GL_TEXTURE5);
-    glBindTexture(GL_TEXTURE_1D, gpu->gl.fogluttex);
+    gls_ActiveTexture(GL_TEXTURE5);
+    gls_BindTexture(GL_TEXTURE_1D, gpu->gl.fogluttex);
     if (gpu->fogLutDirty) {
         gpu->fogLutDirty = false;
         glTexSubImage1D(GL_TEXTURE_1D, 0, 0, countof(gpu->fogLut), GL_RED,
@@ -2477,8 +3043,8 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     ProgSrc* vsrc;
     if (swshaders) {
         vsrc = g_pb.sw_vs;
-        glBindVertexArray(gpu->gl.gpu_vao_sw);
-        glBindBuffer(GL_ARRAY_BUFFER, gpu->gl.gpu_vbos[0]);
+        gls_BindVertexArray(gpu->gl.gpu_vao_sw);
+        gls_BindBuffer(GL_ARRAY_BUFFER, gpu->gl.gpu_vbos[0]);
     } else {
         if (gpu->vsh_uniform_dirty) {
             gpu->vsh_uniform_dirty = false;
@@ -2492,7 +3058,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
             }
             vubuf.b_raw = gpu->regs.vsh.booluniform;
             size_t uoff = stream_put(GL_UNIFORM_BUFFER, &vubuf, sizeof vubuf, g_ubo_align);
-            glBindBufferRange(GL_UNIFORM_BUFFER, 0, g_stream, uoff, sizeof vubuf);
+            gls_BindBufferRange(GL_UNIFORM_BUFFER, 0, g_stream, uoff, sizeof vubuf);
         }
         if (gpu->vsh.code_dirty || !g_pb.cur_hw_vs) {
             u64 hash = gpu_hash_hw_shader(gpu);
@@ -2501,7 +3067,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
             g_pb.cur_hw_vs = p;
         }
         vsrc = g_pb.cur_hw_vs;
-        glBindVertexArray(gpu->gl.gpu_vao_hw);
+        gls_BindVertexArray(gpu->gl.gpu_vao_hw);
     }
 
     // fragment shaders
@@ -2509,12 +3075,12 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
     if (fbufHash != gpu->lastFragUboHash) {
         gpu->lastFragUboHash = fbufHash;
         size_t uoff = stream_put(GL_UNIFORM_BUFFER, &fbuf, sizeof fbuf, g_ubo_align);
-        glBindBufferRange(GL_UNIFORM_BUFFER, 2, g_stream, uoff, sizeof fbuf);
+        gls_BindBufferRange(GL_UNIFORM_BUFFER, 2, g_stream, uoff, sizeof fbuf);
     }
 
     ProgSrc* fsrc;
     if (ctremu.ubershader) {
-        glBindBuffer(GL_UNIFORM_BUFFER, gpu->gl.uber_ubo);
+        gls_BindBuffer(GL_UNIFORM_BUFFER, gpu->gl.uber_ubo);
         glBufferData(GL_UNIFORM_BUFFER, sizeof fcfg, &fcfg, GL_STREAM_DRAW);
         fsrc = g_pb.uber_fs;
     } else {
@@ -2572,7 +3138,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         u32 minind = snap->minind, maxind = snap->maxind;
         indexbuf =
             PTR(gpu->regs.geom.attr_base * 8 + gpu->regs.geom.indexbufoff);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_vstream);
+        gls_BindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_vstream);
         indexoff = snap->index;
         rangemin = minind;
         rangemax = maxind;
@@ -2618,7 +3184,7 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         if (immediate) {
             setup_hw_vao_imm(gpu);
         } else {
-            setup_hw_vao(gpu, snap);
+            setup_hw_vao(gpu, snap, nbufverts);
         }
     }
     Vec_free(gpu->immattrs);
@@ -2637,8 +3203,24 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
                 primMode, prog);
     }
 
+    // spike: SPIKE_SKIPDRAW bit 0 leaves every draw out, bit 1 the lit ones, bit 2 the unlit
+    // ones; to see what the GPU spends its time on. The stats line counts lit draws.
+    // SPIKE_TINYSCISSOR=1 keeps every draw but clips it to one pixel: the CPU and vertex work
+    // stay, the fragment work goes, so the difference is what fragments cost.
+    static int skipdraw = -1, tiny = -1;
+    if (skipdraw < 0) skipdraw = getenv("SPIKE_SKIPDRAW") ? atoi(getenv("SPIKE_SKIPDRAW")) : 0;
+    if (tiny < 0) tiny = getenv("SPIKE_TINYSCISSOR") != nullptr;
+    if (tiny) {
+        gls_Enable(GL_SCISSOR_TEST);
+        gls_Scissor(0, 0, 1, 1);
+    }
+    if (!fcfg.lightDisable) g_draws_lit++;
+    bool skip = (skipdraw & 1) || ((skipdraw & 2) && !fcfg.lightDisable) ||
+                ((skipdraw & 4) && fcfg.lightDisable);
+
     // finally do the draw call
-    if (elements) {
+    if (skip) {
+    } else if (elements) {
         glDrawRangeElementsBaseVertex(prim_mode[primMode], rangemin, rangemax, nverts,
                                       indextypes[indexsize], (void*) indexoff, -basevert);
     } else {

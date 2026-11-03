@@ -28,6 +28,9 @@ typedef void (*PortRequestHandlerArg)(E3DS* s, IPCHeader cmd, u32 cmd_addr,
 
 typedef struct {
     KObject hdr;
+#ifdef SS_LAYOUT_TEST
+    u64 layout_test[5];
+#endif
 
     PortRequestHandlerArg handler;
     u64 arg;

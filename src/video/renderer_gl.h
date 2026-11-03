@@ -4,6 +4,7 @@
 #include <glad/glad.h>
 
 #include "common.h"
+#include "gpuregs.h"
 
 #define MAX_PROGRAM 1024
 
@@ -91,15 +92,42 @@ typedef struct {
     u32 vhash, ihash;
 } DrawSnap;
 
-u32 gpu_gl_vstream_put(const void* data, size_t size, size_t align);
+u32 gpu_gl_vstream_put(const void* data, size_t size, size_t align); // data may be null: room only
+u8* gpu_gl_vstream_ptr();
+
+// spike: how one of a draw's vertex buffers is laid out in the copy the main thread makes of it.
+// Panfrost takes most PICA layouts as they are, but Mesa re-copies every draw whose attributes
+// it cannot: three 16-bit components have no Mali vertex format, and an attribute or a stride
+// not aligned to its component size is not allowed either. That copy runs on the driver thread
+// for every such draw, with a scan of the indices for the vertex range on top (a quarter of
+// that thread in Mario Kart 7). So the main thread lays such buffers out here as it copies them:
+// short3 becomes short4 with w = 1 (what the PICA gives a missing component), everything
+// aligned to its component size. Both threads derive the layout from the same registers.
+typedef struct {
+    int n;        // attributes, the padding entries left out
+    u32 stride;   // of the copy
+    bool changed; // the copy differs from the guest's layout
+    struct {
+        u8 attr, size, type, insize;
+        u16 inoff, off;
+    } a[12];
+} VboLayout;
+void gpu_vbo_layout(const GPURegs* regs, int vbo, VboLayout* out);
 void gpu_gl_frame_fence();
 extern u32 g_vstream_presents;
 extern volatile int g_draw_dump;
 extern int g_lut_misses, g_tex_creates, g_tex_partial, g_draws, g_links, g_tex_same, g_tex_changed, g_tex_again;
 extern u64 g_ns_shaders, g_ns_compile, g_ns_textures, g_ns_progwait;
-extern int g_tex_diffs, g_tex_difftiles, g_tex_new, g_tex_stalefull, g_tex_rehashfull;
+extern int g_tex_diffs, g_tex_difftiles, g_tex_new, g_tex_stalefull, g_tex_rehashfull, g_draws_lit, g_gls_skipped, g_gls_calls, g_draws_relaid;
 extern u64 g_ns_texdiff;
 void gpu_gl_shadows_drop(GPU* gpu);
+// spike: present sets, copies of the two screens handed from the renderer thread to the present thread
+void gpu_gl_present_direct(bool on, int (*busy)(int* out));
+void gpu_gl_present_finish(GLState* state, int sets[2]);
+void gpu_gl_present_draw(GLState* state, const int sets[2], GLuint vao);
+void gpu_gl_present_done(const int sets[2]);
+extern u64 g_gpu_ns;
+extern int g_gpu_n;
 extern int g_prog_ready, g_prog_total;
 void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap);
 

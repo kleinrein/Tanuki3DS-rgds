@@ -5,6 +5,7 @@
 #include <sys/resource.h>
 #include <SDL3/SDL_main.h>
 #include <getopt.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +67,7 @@ static void spike_crash(int sig) {
     raise(sig);
 }
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/syscall.h>
@@ -84,17 +86,20 @@ static void spike_prof_sig(int sig, siginfo_t* si, void* uc) {
     spike_n = i + 1;
 }
 static timer_t spike_timer;
-static void spike_prof_start(void) {
+static void spike_prof_start_tid(pid_t tid) {
     void* warm[4];
     backtrace(warm, 4);
     struct sigaction sa = {.sa_sigaction = spike_prof_sig, .sa_flags = SA_SIGINFO | SA_RESTART};
     sigaction(SIGPROF, &sa, nullptr);
     struct sigevent ev = {.sigev_notify = SIGEV_THREAD_ID, .sigev_signo = SIGPROF};
-    ev._sigev_un._tid = syscall(SYS_gettid);
+    ev._sigev_un._tid = tid;
     timer_create(CLOCK_MONOTONIC, &ev, &spike_timer);
     long us = getenv("SPIKE_PROF_US") ? atol(getenv("SPIKE_PROF_US")) : 10000;
     struct itimerspec t = {{0, us * 1000}, {0, us * 1000}};
     timer_settime(spike_timer, 0, &t, nullptr);
+}
+static void spike_prof_start(void) {
+    spike_prof_start_tid(syscall(SYS_gettid));
 }
 static void spike_prof_dump(void) {
     timer_delete(spike_timer);
@@ -238,7 +243,8 @@ static void spike_frame_done(int w, int h) {
     }
     if (spike_noquit) return;
     const char* from = getenv("SPIKE_PROF_FROM");
-    if (from && spike_frame >= atoi(from) && !getenv("SPIKE_PROF_MAIN")) {
+    if (from && spike_frame >= atoi(from) && !getenv("SPIKE_PROF_MAIN") &&
+        !getenv("SPIKE_PROF_WORKER")) {
         static bool started;
         if (!started) spike_prof_start();
         started = true;
@@ -320,10 +326,176 @@ static void helper_bind() {
         fprintf(stderr, "spike helper context: %s\n", SDL_GetError());
     }
 }
+// spike: the present thread. SDL's KMS swap waits for the previous flip of that panel, so two
+// panels cost the caller up to two vblank waits a frame (11-12 ms of the renderer's 16 in NSMB2).
+// The renderer now hands a copy of the screens to this thread and goes on with the next frame.
+static struct {
+    SDL_GLContext ctx;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int pending, pending_w, pending_h; // the newest frame waiting, -1 for none
+    int pending_sets[2];
+    int inuse;                         // the frame being drawn, -1 for none
+    int inuse_sets[2];
+    bool on;
+    GLuint vao;
+    _Atomic int presented, dropped;
+    _Atomic Uint64 maxgap;
+    Uint64 last;
+} g_pt = {.pending = -1, .inuse = -1, .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+
+// renderer thread: the sets a queued or drawing frame still refers to
+static int present_busy_sets(int* out) {
+    int n = 0;
+    pthread_mutex_lock(&g_pt.mu);
+    if (g_pt.pending >= 0) {
+        out[n++] = g_pt.pending_sets[0];
+        out[n++] = g_pt.pending_sets[1];
+    }
+    if (g_pt.inuse >= 0) {
+        out[n++] = g_pt.inuse_sets[0];
+        out[n++] = g_pt.inuse_sets[1];
+    }
+    pthread_mutex_unlock(&g_pt.mu);
+    return n;
+}
+
+static void present_panels(const int sets[2], int w, int h) {
+    renderer_gl_set_filter(&ctremu.system.gpu.gl, rgds_bridge_filter());
+    static int order = -1;
+    if (order < 0) order = getenv("SPIKE_SWAP_BT") ? 1 : 0;
+    for (int step = 0; step < 2; step++) {
+        int panel = step ^ order;
+        SDL_Window* window = panel ? g_window2 : g_window;
+        Uint64 t0 = SDL_GetTicksNS();
+        SDL_GL_MakeCurrent(window, g_pt.ctx);
+        rgds_bridge_layout(panel, &ctremu.screens[SCREEN_TOP], &ctremu.screens[SCREEN_BOT]);
+        gpu_gl_present_draw(&ctremu.system.gpu.gl, sets, g_pt.vao);
+        rgds_bridge_panel(panel);
+        spike_tag = panel ? "b" : "t";
+        spike_noquit = !step;
+        if (!ctremu.pause) spike_frame_done(w, h);
+        glFlush();
+        Uint64 t1 = SDL_GetTicksNS();
+        SDL_GL_SwapWindow(window);
+        Uint64 t2 = SDL_GetTicksNS();
+        g_present_ns[step][0] += t1 - t0;
+        g_present_ns[step][1] += t2 - t1;
+    }
+    g_present_n++;
+}
+
+static void* present_main(void* arg) {
+    pthread_setname_np(pthread_self(), "ctremu:present");
+    if (getenv("SPIKE_PIN")) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(1, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+    if (!SDL_GL_MakeCurrent(g_window, g_pt.ctx)) {
+        fprintf(stderr, "spike present thread: %s\n", SDL_GetError());
+        return nullptr;
+    }
+    glGenVertexArrays(1, &g_pt.vao);
+    for (;;) {
+        pthread_mutex_lock(&g_pt.mu);
+        while (g_pt.pending < 0) pthread_cond_wait(&g_pt.cv, &g_pt.mu);
+        int sets[2] = {g_pt.pending_sets[0], g_pt.pending_sets[1]};
+        int w = g_pt.pending_w, h = g_pt.pending_h;
+        g_pt.pending = -1;
+        g_pt.inuse = 1;
+        g_pt.inuse_sets[0] = sets[0];
+        g_pt.inuse_sets[1] = sets[1];
+        pthread_mutex_unlock(&g_pt.mu);
+        present_panels(sets, w, h);
+        gpu_gl_present_done(sets);
+        pthread_mutex_lock(&g_pt.mu);
+        g_pt.inuse = -1;
+        pthread_mutex_unlock(&g_pt.mu);
+        atomic_fetch_add(&g_pt.presented, 1);
+        Uint64 now = SDL_GetTicksNS();
+        if (g_pt.last && now - g_pt.last > atomic_load(&g_pt.maxgap)) {
+            atomic_store(&g_pt.maxgap, now - g_pt.last);
+        }
+        g_pt.last = now;
+    }
+    return nullptr;
+}
+
+static void present_thread_start() {
+    if (!g_pt.ctx) return;
+    gpu_gl_present_direct(true, present_busy_sets);
+    pthread_create(&g_pt.thread, nullptr, present_main, nullptr);
+    g_pt.on = true;
+}
+
+// spike: SPIKE_PROF_GL=1 samples the first driver thread (ctremu:gl0) instead of the renderer
+// the lowest task id with that name: the renderer context is created first, so its driver
+// thread has the lowest id of the ctremu:gl0 threads
+static pid_t find_task(const char* name) {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return 0;
+    pid_t found = 0;
+    for (struct dirent* e; (e = readdir(d));) {
+        if (e->d_name[0] == '.') continue;
+        char path[64], comm[32] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        if (fgets(comm, sizeof comm, f) && !strncmp(comm, name, strlen(name))) {
+            pid_t t = atoi(e->d_name);
+            if (!found || t < found) found = t;
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return found;
+}
+static void spike_prof_term(int sig) {
+    spike_prof_dump();
+    fprintf(stderr, "spike profile dumped on signal %d\n", sig);
+    _exit(0);
+}
+
 static void worker_bind(bool on) {
-    SDL_GL_MakeCurrent(g_window, on ? g_glctx : nullptr);
+    // with the present thread the renderer draws into framebuffer objects only, so it holds no surface
+    if (g_pt.on) SDL_GL_MakeCurrent(on ? nullptr : g_window, on ? g_glctx : nullptr);
+    else SDL_GL_MakeCurrent(g_window, on ? g_glctx : nullptr);
 }
 static void worker_present(int w, int h) {
+    // spike: SPIKE_PROF_WORKER=1 with SPIKE_PROF_FROM samples this (the renderer) thread's stacks
+    if ((getenv("SPIKE_PROF_WORKER") || getenv("SPIKE_PROF_GL")) && getenv("SPIKE_PROF_FROM") &&
+        spike_frame >= atoi(getenv("SPIKE_PROF_FROM"))) {
+        static bool started;
+        if (!started) {
+            // the dump happens at quit; a SIGTERM (Home, the test scripts) dumps too
+            signal(SIGTERM, spike_prof_term);
+            if (getenv("SPIKE_PROF_GL")) {
+                pid_t tid = find_task("ctremu:gl0");
+                fprintf(stderr, "spike profiling task %d\n", tid);
+                if (tid) spike_prof_start_tid(tid);
+            } else {
+                spike_prof_start();
+            }
+        }
+        started = true;
+    }
+    if (g_pt.on) {
+        int sets[2];
+        gpu_gl_present_finish(&ctremu.system.gpu.gl, sets);
+        pthread_mutex_lock(&g_pt.mu);
+        if (g_pt.pending >= 0) atomic_fetch_add(&g_pt.dropped, 1);
+        g_pt.pending = 1;
+        g_pt.pending_sets[0] = sets[0];
+        g_pt.pending_sets[1] = sets[1];
+        g_pt.pending_w = w;
+        g_pt.pending_h = h;
+        pthread_cond_signal(&g_pt.cv);
+        pthread_mutex_unlock(&g_pt.mu);
+        return;
+    }
     if (g_window2) {
         // one 3DS screen per panel: the top one 1.6x, the bottom one 2x, unless
         // the game's Graphics page says otherwise
@@ -878,6 +1050,22 @@ int main(int argc, char** argv) {
     signal(SIGBUS, spike_crash);
     signal(SIGABRT, spike_crash);
     read_args(argc, argv);
+    {
+        // spike: RG DS Core's session starts the launcher under taskset -c 0-2 and games inherit
+        // that, so the pin to CPU 3 failed and three threads shared three cores: take every CPU
+        // the cpuset allows (SPIKE_KEEPMASK=1 keeps the inherited mask)
+        cpu_set_t before, all;
+        CPU_ZERO(&before);
+        sched_getaffinity(0, sizeof before, &before);
+        int n = sysconf(_SC_NPROCESSORS_ONLN);
+        CPU_ZERO(&all);
+        for (int i = 0; i < n && i < CPU_SETSIZE; i++) CPU_SET(i, &all);
+        if (!getenv("SPIKE_KEEPMASK") && !CPU_EQUAL(&before, &all)) {
+            int r = sched_setaffinity(0, sizeof all, &all);
+            fprintf(stderr, "spike cpus: %d of %d allowed at start, widened to all: %s\n",
+                    CPU_COUNT(&before), n, r ? strerror(errno) : "ok");
+        }
+    }
     rgds_bridge_start();
 
     const char* basepath = SDL_GetBasePath();
@@ -898,6 +1086,13 @@ int main(int argc, char** argv) {
 #endif
 
     emulator_init();
+    // spike: the internal resolution per game, from the launcher (RGDS_3DS_SCALE=1..4); the ini's
+    // VideoScale otherwise
+    if (getenv("RGDS_3DS_SCALE")) {
+        int sc = atoi(getenv("RGDS_3DS_SCALE"));
+        if (sc >= 1 && sc <= 4) ctremu.videoscale = sc;
+        spike_logf("spike internal scale %d\n", ctremu.videoscale);
+    }
 
     if (romfile_arg) {
         emulator_set_rom(romfile_arg);
@@ -969,6 +1164,15 @@ int main(int argc, char** argv) {
         SDL_GL_MakeCurrent(g_window, glcontext);
         if (g_helperctx) gpu_gl_helper_bind = helper_bind;
         else fprintf(stderr, "spike no helper context: %s\n", SDL_GetError());
+    }
+    if (g_window2 && getenv("SPIKE_NOGUI") && !getenv("SPIKE_NOPRESENTTHREAD")) {
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+        ntasks = list_tasks(tasks, 256);
+        g_pt.ctx = SDL_GL_CreateContext(g_window);
+        place_new_threads(tasks, ntasks, 1, 0);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+        SDL_GL_MakeCurrent(g_window, glcontext);
+        if (!g_pt.ctx) fprintf(stderr, "spike no present context: %s\n", SDL_GetError());
     }
 
 #ifdef GLDEBUGCTX
@@ -1128,6 +1332,11 @@ int main(int argc, char** argv) {
         // spike: the worker owns the gl context, so only without the imgui pass
         if (ctremu.initialized && !gpu_worker_on() && getenv("SPIKE_NOGUI") &&
             !getenv("SPIKE_NOWORKER")) {
+            if (g_pt.ctx && !g_pt.on) {
+                // the present thread takes the window surfaces; the renderer goes surfaceless
+                SDL_GL_MakeCurrent(g_window, nullptr);
+                present_thread_start();
+            }
             gpu_worker_start(&ctremu.system.gpu, worker_bind, worker_present);
             if (getenv("SPIKE_PIN")) {
                 // the emulation core, as RG DS Core's session script keeps CPU 3 for it
@@ -1251,7 +1460,8 @@ int main(int argc, char** argv) {
                             "ms: link %.0f compile %.0f tex %.0f clip %d auddev %.0f "
                             "progwait %.0f progs %d/%d jit %d/%d ms %.1f max %.1f "
                             "pre %d/%d ms %.1f arena %.1f swaps %.1f+%.1f %.1f+%.1f lost %d "
-                            "texdiff %d tiles %d ms %.0f new/stale/rehash %d/%d/%d\n",
+                            "texdiff %d tiles %d ms %.0f new/stale/rehash %d/%d/%d "
+                            "pt %d/%d gap %.0f lit %d gpu %.1f glcalls %d/%d relaid %d\n",
                             busy / n, present / n, wait / n, copies, wraps,
                             gpu_worker_drawn(), n, g_lut_misses, gpu_worker_transfers(),
                             g_draws / (n ? n : 1), g_tex_creates, g_tex_partial,
@@ -1268,7 +1478,16 @@ int main(int argc, char** argv) {
                             g_present_ns[1][0] / 1e6 / (g_present_n ? g_present_n : 1),
                             g_present_ns[1][1] / 1e6 / (g_present_n ? g_present_n : 1),
                             gpu_worker_lost(), g_tex_diffs, g_tex_difftiles, g_ns_texdiff / 1e6,
-                            g_tex_new, g_tex_stalefull, g_tex_rehashfull);
+                            g_tex_new, g_tex_stalefull, g_tex_rehashfull,
+                            atomic_exchange(&g_pt.presented, 0), atomic_exchange(&g_pt.dropped, 0),
+                            atomic_exchange(&g_pt.maxgap, 0) / 1e6, g_draws_lit / (n ? n : 1),
+                            g_gpu_n ? g_gpu_ns / 1e6 / g_gpu_n : 0.0,
+                            g_gls_calls - g_gls_skipped, g_gls_calls, g_draws_relaid);
+                    g_gls_calls = g_gls_skipped = 0;
+                    g_draws_relaid = 0;
+                    g_draws_lit = 0;
+                    g_gpu_ns = 0;
+                    g_gpu_n = 0;
                     g_tex_diffs = g_tex_difftiles = g_tex_new = g_tex_stalefull = g_tex_rehashfull = 0;
                     g_ns_texdiff = 0;
                     memset(g_present_ns, 0, sizeof g_present_ns);

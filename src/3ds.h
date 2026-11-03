@@ -29,7 +29,10 @@ enum {
 #define SCREEN_HEIGHT 240
 
 typedef struct _3DS {
-    ArmCore cpu;
+    ArmCore cpu; // first: the CPU callbacks cast it to E3DS
+#ifdef SS_LAYOUT_TEST
+    u8 layout_test[4099];
+#endif
 
     GPU gpu;
     DSP dsp;

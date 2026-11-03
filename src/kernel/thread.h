@@ -22,6 +22,9 @@ enum {
 
 typedef struct _KThread {
     KObject hdr;
+#ifdef SS_LAYOUT_TEST
+    u64 layout_test[7];
+#endif
 
     struct {
         union {
@@ -61,6 +64,9 @@ typedef void (*KEventCallback)(E3DS*);
 
 typedef struct {
     KObject hdr;
+#ifdef SS_LAYOUT_TEST
+    u64 layout_test[3];
+#endif
 
     bool signal;
     bool sticky;

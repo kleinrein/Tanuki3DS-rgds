@@ -82,7 +82,8 @@ size_t ka_used() {
     return ka_header()->cur - (char*) KA_BASE;
 }
 
-void ka_ensure(size_t used) {
-    (void) used;
-    ka_header();
+void ka_reset() {
+    KaHeader* h = ka_header();
+    memset(h->free, 0, sizeof h->free);
+    h->cur = (char*) h + ((sizeof(KaHeader) + 15) & ~15ull);
 }

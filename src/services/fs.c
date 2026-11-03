@@ -754,6 +754,8 @@ DECL_PORT_ARG(fs_file, fd) {
             cmdbuf[1] = 0;
             fseek(fp, offset, SEEK_SET);
             cmdbuf[2] = fwrite(data, 1, size, fp);
+            // past the C library at once: a crash or a kill must not lose what the game saved
+            fflush(fp);
             break;
         }
         case 0x0804: {
@@ -776,6 +778,9 @@ DECL_PORT_ARG(fs_file, fd) {
         }
         case 0x0808: {
             linfo("closing file");
+            // a game closes a save when it has finished writing it: put it on the card
+            fflush(fp);
+            fsync(fileno(fp));
             fclose(fp);
             s->services.fs.files[fd] = nullptr;
             cmdbuf[0] = IPCHDR(1, 0);

@@ -35,6 +35,9 @@ typedef union {
 #define TEX_MAX 256
 
 typedef struct _FBInfo {
+#ifdef SS_LAYOUT_TEST
+    u64 layout_test[3];
+#endif
     union {
         u64 color_paddr;
         u64 key;
@@ -80,6 +83,7 @@ typedef struct _TexInfo {
     u8* shadow;
     u32 shadow_size;
     u32 dirty_lo, dirty_hi;
+    u32 checked_frame; // the frame the whole texture was last compared in
 
     struct _TexInfo *next, *prev;
 
