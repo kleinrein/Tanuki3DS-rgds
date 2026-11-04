@@ -257,6 +257,7 @@ static void spike_frame_done(int w, int h) {
 }
 
 extern u64 g_jit_ns, g_jit_max;
+extern int g_jit_dispatches, g_jit_disp_c, g_jit_disp_evict;
 extern int g_jit_blocks, g_jit_roots;
 extern u64 g_jit_pre_ns;
 extern int g_jit_pre_roots, g_jit_pre_blocks;
@@ -343,6 +344,11 @@ static struct {
     _Atomic int presented, dropped;
     _Atomic Uint64 maxgap;
     Uint64 last;
+    // spike: the cadence for games that present every other refresh (see present_main)
+    Uint64 pending_t;         // when the renderer handed the pending frame over
+    Uint64 flip0;             // when the first panel's last flip returned
+    _Atomic int held;         // frames held back for the second refresh, per stats window
+    _Atomic int flips[3];     // gaps between first-panel flips of 1, 2 and 3+ refreshes
 } g_pt = {.pending = -1, .inuse = -1, .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
 // renderer thread: the sets a queued or drawing frame still refers to
@@ -382,8 +388,49 @@ static void present_panels(const int sets[2], int w, int h) {
         Uint64 t2 = SDL_GetTicksNS();
         g_present_ns[step][0] += t1 - t0;
         g_present_ns[step][1] += t2 - t1;
+        if (step == 0) {
+            // the swap returns with the flip: the first panel's flips are the cadence
+            if (g_pt.flip0) {
+                double refreshes = (t2 - g_pt.flip0) / 16.667e6;
+                atomic_fetch_add(&g_pt.flips[refreshes < 1.5 ? 0 : refreshes < 2.5 ? 1 : 2], 1);
+            }
+            g_pt.flip0 = t2;
+        }
     }
     g_present_n++;
+}
+
+// spike: a game that presents every other refresh (Super Mario 3D Land, 30 fps by design) only looks
+// smooth when every image stays up for exactly two refreshes. Its images become ready at a point
+// that drifts against the panel, since the emulator's clock and the panel's are not the same, and a
+// frame that takes the main thread 21 ms every other refresh moves that point about as well; an
+// image ready just before a refresh then shows for one refresh and the next for three. So while
+// images arrive about two refreshes apart, one that is ready before the first refresh after the
+// last flip has passed is held until 23 ms after that flip, and its swap lands on the second.
+// Costs up to one refresh of latency in such a game, nothing in a 60 fps one. SPIKE_NOCADENCE=1
+// turns it off.
+static void present_cadence(Uint64 arrived) {
+    static int on = -1;
+    static Uint64 last_arrival, arrival_avg;
+    if (on < 0) on = getenv("SPIKE_NOCADENCE") == nullptr;
+    if (last_arrival && arrived > last_arrival) {
+        Uint64 gap = arrived - last_arrival;
+        if (gap > 100 * 1000000ull) gap = 100 * 1000000ull;
+        arrival_avg += ((s64) gap - (s64) arrival_avg) / 8;
+    }
+    last_arrival = arrived;
+    if (!on || !g_pt.flip0) return;
+    bool every_other = arrival_avg > 26 * 1000000ull && arrival_avg < 42 * 1000000ull;
+    if (!every_other) return;
+    Uint64 hold_until = g_pt.flip0 + 23 * 1000000ull;
+    Uint64 now = SDL_GetTicksNS();
+    // an image that arrived right after a flip waits a whole refresh too: 3D Land makes 16 images in
+    // some 30 refreshes, and holding the extra one lets the renderer replace it with the next, so
+    // one image a second is skipped instead of two shown for a single refresh
+    if (hold_until > now && hold_until - now < 34 * 1000000ull) {
+        SDL_DelayPrecise(hold_until - now);
+        atomic_fetch_add(&g_pt.held, 1);
+    }
 }
 
 static void* present_main(void* arg) {
@@ -404,11 +451,13 @@ static void* present_main(void* arg) {
         while (g_pt.pending < 0) pthread_cond_wait(&g_pt.cv, &g_pt.mu);
         int sets[2] = {g_pt.pending_sets[0], g_pt.pending_sets[1]};
         int w = g_pt.pending_w, h = g_pt.pending_h;
+        Uint64 arrived = g_pt.pending_t;
         g_pt.pending = -1;
         g_pt.inuse = 1;
         g_pt.inuse_sets[0] = sets[0];
         g_pt.inuse_sets[1] = sets[1];
         pthread_mutex_unlock(&g_pt.mu);
+        present_cadence(arrived);
         present_panels(sets, w, h);
         gpu_gl_present_done(sets);
         pthread_mutex_lock(&g_pt.mu);
@@ -492,6 +541,7 @@ static void worker_present(int w, int h) {
         g_pt.pending_sets[1] = sets[1];
         g_pt.pending_w = w;
         g_pt.pending_h = h;
+        g_pt.pending_t = SDL_GetTicksNS();
         pthread_cond_signal(&g_pt.cv);
         pthread_mutex_unlock(&g_pt.mu);
         return;
@@ -1461,7 +1511,7 @@ int main(int argc, char** argv) {
                             "progwait %.0f progs %d/%d jit %d/%d ms %.1f max %.1f "
                             "pre %d/%d ms %.1f arena %.1f swaps %.1f+%.1f %.1f+%.1f lost %d "
                             "texdiff %d tiles %d ms %.0f new/stale/rehash %d/%d/%d "
-                            "pt %d/%d gap %.0f lit %d gpu %.1f glcalls %d/%d relaid %d\n",
+                            "pt %d/%d/%d gap %.0f flips %d/%d/%d lit %d gpu %.1f glcalls %d/%d relaid %d disp %d/%d/%d\n",
                             busy / n, present / n, wait / n, copies, wraps,
                             gpu_worker_drawn(), n, g_lut_misses, gpu_worker_transfers(),
                             g_draws / (n ? n : 1), g_tex_creates, g_tex_partial,
@@ -1480,9 +1530,14 @@ int main(int argc, char** argv) {
                             gpu_worker_lost(), g_tex_diffs, g_tex_difftiles, g_ns_texdiff / 1e6,
                             g_tex_new, g_tex_stalefull, g_tex_rehashfull,
                             atomic_exchange(&g_pt.presented, 0), atomic_exchange(&g_pt.dropped, 0),
-                            atomic_exchange(&g_pt.maxgap, 0) / 1e6, g_draws_lit / (n ? n : 1),
+                            atomic_exchange(&g_pt.held, 0), atomic_exchange(&g_pt.maxgap, 0) / 1e6,
+                            atomic_exchange(&g_pt.flips[0], 0), atomic_exchange(&g_pt.flips[1], 0),
+                            atomic_exchange(&g_pt.flips[2], 0), g_draws_lit / (n ? n : 1),
                             g_gpu_n ? g_gpu_ns / 1e6 / g_gpu_n : 0.0,
-                            g_gls_calls - g_gls_skipped, g_gls_calls, g_draws_relaid);
+                            g_gls_calls - g_gls_skipped, g_gls_calls, g_draws_relaid,
+                            g_jit_dispatches / (n ? n : 1), g_jit_disp_c / (n ? n : 1),
+                            g_jit_disp_evict / (n ? n : 1));
+                    g_jit_dispatches = g_jit_disp_c = g_jit_disp_evict = 0;
                     g_gls_calls = g_gls_skipped = 0;
                     g_draws_relaid = 0;
                     g_draws_lit = 0;

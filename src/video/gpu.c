@@ -695,7 +695,51 @@ void gpu_reset_needs_rehesh(GPU* gpu) {
     }
 }
 
+// spike: the vertex shader's float uniform FIFO takes most of a command list's words in Mario
+// Kart 7 (a matrix or two per draw, three or four words per vec4), and each went through
+// gpu_write_internalreg's 300-way switch; this is the same state machine as there, in a loop
+static void gw_uniform_run(GPU* gpu, const u32* p, int n) {
+    gpu->vsh_uniform_dirty = true;
+    for (int i = 0; i < n; i++) {
+        u32 param = p[i];
+        u32 idx = gpu->regs.vsh.floatuniform_idx;
+        if (idx >= 96) {
+            lwarnonce("writing to out of bound uniform %d", idx);
+            continue;
+        }
+        fvec4* uniform = &gpu->vsh.floatuniform[idx];
+        if (gpu->regs.vsh.floatuniform_mode) {
+            (*uniform)[3 - gpu->vsh.curunifi] = I2F(param);
+            if (++gpu->vsh.curunifi == 4) {
+                gpu->vsh.curunifi = 0;
+                gpu->regs.vsh.floatuniform_idx++;
+            }
+        } else {
+            switch (gpu->vsh.curunifi) {
+                case 0:
+                    (*uniform)[3] = cvtf24(param >> 8);
+                    gpu->vsh.curuniform = (param & 0xff) << 16;
+                    gpu->vsh.curunifi = 1;
+                    break;
+                case 1:
+                    (*uniform)[2] = cvtf24(param >> 16 | gpu->vsh.curuniform);
+                    gpu->vsh.curuniform = (param & MASK(16)) << 8;
+                    gpu->vsh.curunifi = 2;
+                    break;
+                case 2:
+                    (*uniform)[1] = cvtf24(param >> 24 | gpu->vsh.curuniform);
+                    (*uniform)[0] = cvtf24(param & MASK(24));
+                    gpu->vsh.curunifi = 0;
+                    gpu->regs.vsh.floatuniform_idx++;
+                    break;
+            }
+        }
+    }
+}
+
 static void gw_exec_cmds(GPU* gpu, u32* cur, u32* end) {
+    static int fast = -1;
+    if (fast < 0) fast = getenv("SPIKE_NOUNIFORMRUN") == nullptr;
     while (cur < end) {
         GPUCommand c = {cur[1]};
         u32 mask = 0;
@@ -703,6 +747,17 @@ static void gw_exec_cmds(GPU* gpu, u32* cur, u32* end) {
         if (c.mask & BIT(1)) mask |= 0xff << 8;
         if (c.mask & BIT(2)) mask |= 0xff << 16;
         if (c.mask & BIT(3)) mask |= 0xff << 24;
+
+        if (fast && mask == 0xffffffff && c.id >= GPUREG(vsh.floatuniform_data[0]) &&
+            c.id + (c.incmode ? c.nparams : 0) <= GPUREG(vsh.floatuniform_data[7])) {
+            // every one of the eight data registers is the same FIFO, so the increment mode
+            // changes nothing; the raw register copy keeps the last word as the switch would
+            gw_uniform_run(gpu, cur, 1);
+            gw_uniform_run(gpu, cur + 2, c.nparams);
+            gpu->regs.w[c.id + (c.incmode ? c.nparams : 0)] = c.nparams ? cur[1 + c.nparams] : cur[0];
+            cur += 2 + c.nparams + (c.nparams & 1);
+            continue;
+        }
 
         gpu_write_internalreg(gpu, c.id, cur[0], mask);
         cur += 2;

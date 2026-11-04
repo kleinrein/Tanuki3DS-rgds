@@ -45,6 +45,9 @@
     (EMITI0(LOAD_REG, 15), EMITVI(AND, LASTV, cpu->cpsr.t ? ~1 : ~3),          \
      EMITIV(STORE_REG, 15, LASTV))
 
+// spike: END_RET op1 = 1 lets the block go on through the inline cache (backend_arm.c) instead of
+// returning to C; create_jit_block clears it again for a block that raised an exception, halted,
+// wrote cp15 or switched modes, since C applies those to the register file between blocks
 void compile_block(ArmCore* cpu, IRBlock* block, u32 start_addr) {
 
     block->start_addr = start_addr;
@@ -67,7 +70,7 @@ void compile_block(ArmCore* cpu, IRBlock* block, u32 start_addr) {
         if (((addr & MASK(16)) == 0) || !can_continue) break;
     }
     EMITI_STORE_REG(15, addr);
-    EMIT00(END_RET);
+    EMITI0(END_RET, 1);
     block->end_addr = addr;
 }
 
@@ -366,7 +369,7 @@ DECL_ARM_COMPILE(data_proc) {
             } else {
                 EMIT_ALIGN_PC();
             }
-            EMIT00(END_RET);
+            EMITI0(END_RET, 1);
             return false;
         }
     }
@@ -410,7 +413,7 @@ DECL_ARM_COMPILE(psr_trans) {
             if (mask & 0xffff) {
                 EMITI0(MODESWITCH, cpu->cpsr.m);
                 EMITI_STORE_REG(15, addr + INSTRLEN);
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             } else {
                 return true;
@@ -572,7 +575,7 @@ DECL_ARM_COMPILE(branch_exch) {
     EMITV0(PCMASK, vt);
     EMITVV(AND, vdest, LASTV);
     EMITV_STORE_REG(15, LASTV);
-    EMIT00(END_RET);
+    EMITI0(END_RET, 1);
     return false;
 }
 
@@ -824,7 +827,7 @@ DECL_ARM_COMPILE(half_trans) {
             EMITV_STORE_REG(instr.half_trans.rd, LASTV);
             if (instr.half_trans.rd == 15) {
                 EMIT_ALIGN_PC();
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             }
             return true;
@@ -860,7 +863,7 @@ DECL_ARM_COMPILE(half_trans) {
             EMITV_STORE_REG(instr.half_trans.rd, LASTV);
             if (instr.half_trans.rd == 15) {
                 EMIT_ALIGN_PC();
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             }
             return true;
@@ -967,7 +970,7 @@ DECL_ARM_COMPILE(single_trans) {
             EMITV_STORE_REG(instr.single_trans.rd, LASTV);
             if (instr.single_trans.rd == 15) {
                 EMIT_ALIGN_PC();
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             }
             return true;
@@ -993,7 +996,7 @@ DECL_ARM_COMPILE(single_trans) {
                 EMITV0(PCMASK, vt);
                 EMITVV(AND, vpc, LASTV);
                 EMITV_STORE_REG(15, LASTV);
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             }
             return true;
@@ -1106,7 +1109,7 @@ DECL_ARM_COMPILE(block_trans) {
                 EMITV0(PCMASK, vt);
                 EMITVV(AND, vpc, LASTV);
                 EMITV_STORE_REG(15, LASTV);
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             }
             return true;
@@ -1141,7 +1144,7 @@ DECL_ARM_COMPILE(branch) {
                     vdest = EMITVI(AND, vdest, ~3);
                 }
                 EMITV_STORE_REG(15, vdest);
-                EMIT00(END_RET);
+                EMITI0(END_RET, 1);
                 return false;
             } else {
                 if (offset & BIT(22)) dest += 0xff800000;
@@ -1162,7 +1165,7 @@ DECL_ARM_COMPILE(branch) {
         block->loop = true;
         EMIT00(NOP);
     }
-    EMIT00(END_RET);
+    EMITI0(END_RET, 1);
     return false;
 }
 
@@ -1258,14 +1261,14 @@ DECL_ARM_COMPILE(cp_reg_trans) {
 DECL_ARM_COMPILE(undefined) {
     EMITI_STORE_REG(15, addr + INSTRLEN);
     EMITII(EXCEPTION, E_UND, instr.w);
-    EMIT00(END_RET);
+    EMITI0(END_RET, 1);
     return false;
 }
 
 DECL_ARM_COMPILE(sw_intr) {
     EMITI_STORE_REG(15, addr + INSTRLEN);
     EMITII(EXCEPTION, E_SWI, instr.w);
-    EMIT00(END_RET);
+    EMITI0(END_RET, 1);
     return false;
 }
 

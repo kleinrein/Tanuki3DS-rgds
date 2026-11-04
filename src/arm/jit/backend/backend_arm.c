@@ -1,6 +1,8 @@
 #ifdef __aarch64__
 
 #include "backend_arm.h"
+#include "arm/jit/jit.h"
+#include <stdlib.h>
 
 #ifndef NOCAPSTONE
 #include <capstone/capstone.h>
@@ -52,6 +54,11 @@ static void print_hostregs(HostRegAllocation* hralloc) {
 }
 
 #define SPDISP() ((backend->hralloc.count[REG_STACK] * 4 + 15) & ~15)
+static bool g_jit_ic_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SPIKE_NOIC") == nullptr;
+    return on;
+}
 
 static int getOp(ArmCodeBackend* backend, int i) {
     int assn = backend->regalloc->reg_assn[i];
@@ -952,6 +959,40 @@ ArmCodeBackend* backend_arm_generate_code(IRBlock* ir, RegAllocation* regalloc,
                     Vec_push(backend->links, p);
                     DWORD(linklabel);
                     L(nolink);
+                }
+
+                if (inst.opcode == IR_END_RET && inst.op1 && g_jit_ic_on()) {
+                    // spike: a plain indirect branch (op1, translator.c) looks its target up in the
+                    // inline cache (jit.h) while cycles remain, and only falls back to the dispatcher
+                    // in C on a miss. Other ends return to C: a system call may have switched threads,
+                    // which C applies to the register file before the next block
+                    LABEL(icmiss);
+                    LABEL(ictab);
+                    CMPX(R0, 0);
+                    BLE(icmiss);
+                    LDR(R1, CPU(r[15]));
+                    LDR(R2, CPU(cpsr));
+                    UBFX(R2, R2, 0, 6);
+                    LSR(IP1, R1, 2); // JIT_IC_INDEX
+                    LSR(IP0, R1, 1);
+                    EOR(IP1, IP1, IP0);
+                    UBFX(IP1, IP1, 0, JIT_IC_BITS);
+                    LSL(IP1, IP1, 4);
+                    LDRLX(IP0, ictab);
+                    ADDX(IP0, IP0, IP1);
+                    LDRW(IP1, (IP0, 0));
+                    CMP(IP1, R1);
+                    BNE(icmiss);
+                    LDRW(IP1, (IP0, 4));
+                    CMP(IP1, R2);
+                    BNE(icmiss);
+                    LDRX(IP0, (IP0, 8));
+                    CBZX(IP0, icmiss);
+                    BR(IP0);
+                    ALIGN(8);
+                    L(ictab);
+                    DWORD((u64) (uintptr_t) g_jit_ic);
+                    L(icmiss);
                 }
 
                 BR(R27);

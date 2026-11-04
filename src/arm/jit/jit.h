@@ -53,4 +53,18 @@ void jit_free_all(ArmCore* cpu);
 
 void arm_exec_jit(ArmCore* cpu);
 
+// spike: the inline cache for block ends that cannot link (bx lr, pointer calls, mode changes): the
+// block looks its target up here before returning to C. Indexed by guest pc bits 1.., checked by pc
+// and the block attributes (the low 6 bits of the cpsr). Filled by arm_exec_jit, emptied whenever a
+// block is destroyed.
+// 4096 entries left 1750 conflict misses a refresh in 3D Land (ARM code only ever used half of
+// them); 65536 (1 MB) is the size that holds a 3D game's call graph.
+#define JIT_IC_BITS 16
+#define JIT_IC_INDEX(pc) ((((pc) >> 2) ^ ((pc) >> 1)) & ((1 << JIT_IC_BITS) - 1))
+typedef struct {
+    u32 pc, attrs;
+    JITFunc code;
+} JitIcEnt;
+extern JitIcEnt g_jit_ic[1 << JIT_IC_BITS];
+
 #endif

@@ -25,6 +25,10 @@
 #endif
 
 JITConfig g_jit_config;
+// spike: see jit.h. 3D Land spent 21% of its main thread in the C round trip these ends used to take.
+JitIcEnt g_jit_ic[1 << JIT_IC_BITS];
+static bool g_jit_ic_used;
+int g_jit_dispatches, g_jit_disp_c, g_jit_disp_evict; // blocks entered from C, per stats window (main.c)
 u64 g_jit_ns, g_jit_max;
 int g_jit_blocks, g_jit_roots;
 
@@ -194,6 +198,19 @@ JITBlock* create_jit_block(ArmCore* cpu, u32 addr) {
         optimize_deadcode(&ir);
         if (g_jit_config.linking) optimize_blocklinking(&ir, cpu);
     }
+    {
+        // spike: see compile_block: a block that needs C between it and the next one returns there
+        bool needs_c = false;
+        for (int i = 0; i < ir.code.size; i++) {
+            u32 o = ir.code.d[i].opcode;
+            if (o == IR_EXCEPTION || o == IR_HALT || o == IR_CP15_WRITE || o == IR_MODESWITCH) needs_c = true;
+        }
+        if (needs_c) {
+            for (int i = 0; i < ir.code.size; i++) {
+                if (ir.code.d[i].opcode == IR_END_RET) ir.code.d[i].op1 = 0;
+            }
+        }
+    }
 
     block->end_addr = ir.end_addr;
 
@@ -225,6 +242,11 @@ JITBlock* create_jit_block(ArmCore* cpu, u32 addr) {
 }
 
 void destroy_jit_block(JITBlock* block) {
+    // the cache may point into this block's code; empty it once, not once per block of a batch
+    if (g_jit_ic_used) {
+        memset(g_jit_ic, 0, sizeof g_jit_ic);
+        g_jit_ic_used = false;
+    }
     if (g_jit_config.ir_interpret) {
         irblock_free(block->ir);
         free(block->ir);
@@ -398,6 +420,15 @@ __attribute__((naked)) static void jit_enter(JITFunc code, ArmCore* cpu, void* f
 
 void arm_exec_jit(ArmCore* cpu) {
     JITBlock* block = get_jitblock(cpu, cpu->cpsr.jitattrs, cpu->pc);
+    JitIcEnt* e = &g_jit_ic[JIT_IC_INDEX(cpu->pc)];
+    // a dispatch with the entry already right came from an end that must return to C
+    if (e->pc == cpu->pc && e->attrs == cpu->cpsr.jitattrs && e->code == block->code) g_jit_disp_c++;
+    else if (e->code) g_jit_disp_evict++;
+    e->pc = cpu->pc;
+    e->attrs = cpu->cpsr.jitattrs;
+    e->code = block->code;
+    g_jit_ic_used = true;
+    g_jit_dispatches++;
     jit_enter(block->code, cpu, cpu->fastmem);
 }
 #else

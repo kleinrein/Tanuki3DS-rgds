@@ -550,11 +550,12 @@ static int pset_pick(GLState* state) {
     }
     g_pset_last = s;
     // Writing a set the present thread drew from a few frames ago needs no wait here: Panfrost's
-    // kernel driver orders the write after earlier reads of the same buffer (implicit sync),
-    // and a client wait is a glthread sync point that drains the whole queue, so the driver
-    // thread and this one stop overlapping once a frame (at the clock the chip throttles to
-    // after ten minutes of racing that cost frames: 99.5% -> 99.8% drawn without it, and the
-    // driver thread 39% -> 34% of a core). SPIKE_PSETWAIT=1 waits anyway, for comparison.
+    // kernel driver orders the write after the earlier reads of the same buffer (implicit sync),
+    // and a client wait is a glthread sync point that drains this thread's queue, so this thread
+    // and the driver thread stop overlapping once a frame. Through the launcher that costs 5.5 ms
+    // of every frame (2.5 on a bare test launch) and a fifth of the frames in a race (the owner's
+    // runs 2026-11-04: 78% drawn with the wait, 97.5% without; blinking reported with either was
+    // other launches fighting over the panels). SPIKE_PSETWAIT=1 waits anyway, for comparison.
     static int wait = -1;
     if (wait < 0) wait = getenv("SPIKE_PSETWAIT") != nullptr;
     if (g_pset_done[s]) {
