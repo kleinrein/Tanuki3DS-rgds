@@ -671,6 +671,356 @@ const char* alphatest_str(int alphafunc) {
     }
 }
 
+// ---- uber shader: the configuration the generated shaders bake in, read from
+// a uniform block instead. Keep it in step with shader_gen_fs() below.
+const char fs_uber_body[] = R"(
+struct TevSide {
+    int src0; int op0; int src1; int op1; int src2; int op2;
+    int combiner; float scale;
+};
+struct Tev { TevSide rgb; TevSide a; };
+
+layout (std140) uniform FragConfig {
+    Tev tev[6];
+    uint c_tevbuf;
+    uint c_texconfig;
+    int c_tex0type;
+    int c_shadowPerspective;
+    uint c_proctex;
+    int c_pad0; int c_pad1; int c_pad2;
+    uvec4 c_light[8];
+    int c_numlights;
+    uint c_lconfig0;
+    uint c_lconfig1;
+    uint c_llutAbs;
+    uint c_llutSel;
+    uint c_llutScale;
+    uint c_lightPerm;
+    int c_lightDisable;
+    int c_fragOp;
+    int c_alphatest;
+    int c_alphafunc;
+};
+
+#define BITS(v, s, n) (((v) >> uint(s)) & ((1u << uint(n)) - 1u))
+#define BITSET(v, s) ((((v) >> uint(s)) & 1u) != 0u)
+
+const uint envLutsTab[8] = uint[](0xc5u, 0xccu, 0xc3u, 0x8bu, 0xf7u, 0xfdu, 0xcfu, 0xffu);
+
+vec4 tex0c, tex1c, tex2c, tex3c, lprimary, lsecondary, cur, buf;
+vec3 n, t, v, l, h, h_proj, p;
+
+vec4 texsel(uint i) {
+    if (i == 0u) return tex0c;
+    if (i == 1u) return tex1c;
+    if (i == 2u) return tex2c;
+    return tex3c;
+}
+
+float lutinput(uint sel) {
+    if (sel == 0u) return dot(n, h);
+    if (sel == 1u) return dot(v, h);
+    if (sel == 2u) return dot(n, v);
+    if (sel == 3u) return dot(n, l);
+    if (sel == 4u) return dot(l, p);
+    if (sel == 5u) return dot(t, h_proj);
+    return 0.0;
+}
+
+float lutread(int lutNum, float layer) {
+    float x = lutinput(BITS(c_llutSel, 4 * lutNum, 3));
+    float c = BITSET(c_llutAbs, 4 * lutNum + 1)
+        ? fract(clamp(x * 128.0, -127.5, 127.5) / 256.0) : abs(x);
+    float r = texture(lightLuts, vec2(c, layer)).r;
+    int e = int(BITS(c_llutScale, 4 * lutNum, 3));
+    if (e >= 4) e -= 8;
+    if (e != 0) r *= exp2(float(e));
+    return r;
+}
+
+void lighting() {
+    n = normalize(normal);
+    t = normalize(tangent);
+    uint bumpMode = BITS(c_lconfig0, 28, 2);
+    if (bumpMode != 0u) {
+        vec3 bumpVec = 2.0 * texsel(BITS(c_lconfig0, 22, 2)).xyz - 1.0;
+        if (!BITSET(c_lconfig0, 30)) {
+            bumpVec.z = sqrt(max(1.0 - dot(bumpVec.xy, bumpVec.xy), 0.0));
+        }
+        mat3 tbn = mat3(t, cross(n, t), n);
+        if (bumpMode == 1u) n = normalize(tbn * bumpVec);
+        if (bumpMode == 2u) t = normalize(tbn * bumpVec);
+    }
+    v = normalize(view);
+
+    vec4 H = vec4(1.0);
+    if (BITSET(c_lconfig0, 0)) {
+        H = texsel(BITS(c_lconfig0, 24, 2));
+        if (BITSET(c_lconfig0, 18)) H = 1.0 - H;
+    }
+
+    l = vec3(0.0); h = vec3(0.0); h_proj = vec3(0.0); p = vec3(0.0);
+    float dist = 0.0;
+
+    uint envLuts = envLutsTab[BITS(c_lconfig0, 4, 3)];
+    uint enabledLuts = envLuts & ~BITS(c_lconfig1, 16, 8);
+    bool use_R = BITSET(envLuts, 6) && (enabledLuts & 0x70u) != 0u;
+
+    for (int k = 0; k < c_numlights; k++) {
+        int i = int(BITS(c_lightPerm, 4 * k, 3));
+        uint lc = c_light[i].x;
+
+        if (BITSET(lc, 0)) l = light[i].vec;
+        else l = view + light[i].vec;
+        dist = length(l);
+        l /= dist;
+        h = normalize(l + v);
+        h_proj = normalize(h - n * dot(n, h));
+        p = normalize(light[i].spotdir.xyz);
+
+        float ndotl = BITSET(lc, 1) ? abs(dot(n, l)) : max(dot(n, l), 0.0);
+        vec3 cp = ndotl * light[i].diffuse;
+        float G = ndotl / dot(l + v, l + v);
+
+        vec3 R = vec3(1.0);
+        if (use_R) {
+            if (BITSET(envLuts, 5)) {
+                if (BITSET(enabledLuts, 6)) R.r = lutread(6, 6.0);
+                if (BITSET(enabledLuts, 5)) R.g = lutread(5, 5.0);
+                if (BITSET(enabledLuts, 4)) R.b = lutread(4, 4.0);
+            } else if (BITSET(enabledLuts, 6)) {
+                R = vec3(lutread(6, 6.0));
+            }
+        }
+
+        vec3 s0 = light[i].specular0;
+        if (BITSET(enabledLuts, 0)) s0 *= lutread(0, 0.0);
+        if (BITSET(lc, 2)) s0 *= G;
+        vec3 s1 = light[i].specular1;
+        if (BITSET(enabledLuts, 1)) s1 *= lutread(1, 1.0);
+        if (use_R) s1 *= R;
+        if (BITSET(lc, 3)) s1 *= G;
+        vec3 cs = s0 + s1;
+
+        if (!BITSET(BITS(c_lconfig1, 0, 8), i)) {
+            if (BITSET(c_lconfig0, 16)) cp *= H.rgb;
+            if (BITSET(c_lconfig0, 17)) cs *= H.rgb;
+        }
+
+        cp += light[i].ambient;
+
+        if (BITSET(c_lconfig0, 27)) {
+            float f = float(dot(n, l) >= 0.0);
+            cp *= f;
+            cs *= f;
+        }
+        if (BITSET(envLuts, 2) && !BITSET(BITS(c_lconfig1, 8, 8), i)) {
+            float S = lutread(2, 8.0 + float(i));
+            cp *= S;
+            cs *= S;
+        }
+        if (BITSET(envLuts, 7) && !BITSET(BITS(c_lconfig1, 24, 8), i)) {
+            float A = texture(lightLuts, vec2(
+                light[i].attn_bias + light[i].attn_scale * dist,
+                16.0 + float(i))).r;
+            cp *= A;
+            cs *= A;
+        }
+        lprimary.rgb += cp;
+        lsecondary.rgb += cs;
+    }
+
+    lprimary.a = 1.0;
+    lsecondary.a = 1.0;
+    if (BITSET(enabledLuts, 3) && (BITSET(c_lconfig0, 2) || BITSET(c_lconfig0, 3))) {
+        float fr = lutread(3, 3.0);
+        if (BITSET(c_lconfig0, 2)) lprimary.a = fr;
+        if (BITSET(c_lconfig0, 3)) lsecondary.a = fr;
+    }
+    if (BITSET(c_lconfig0, 19)) {
+        lprimary.a *= H.a;
+        lsecondary.a *= H.a;
+    }
+    lprimary.rgb += ambient_color;
+    lprimary = min(lprimary, 1.0);
+    lsecondary = min(lsecondary, 1.0);
+}
+
+float ptclamp(float x, uint mode) {
+    if (mode == 0u) return x >= 1.0 ? 0.0 : max(x, 0.0);
+    if (mode == 1u) return clamp(x, 0.0, 1.0);
+    if (mode == 2u) return fract(x);
+    if (mode == 3u) return (int(x) & 1) == 1 ? fract(-x) : fract(x);
+    if (mode == 4u) return float(x > 0.5);
+    return x;
+}
+
+float ptcombine(vec2 c, uint comb) {
+    if (comb == 0u) return c.x;
+    if (comb == 1u) return c.x * c.x;
+    if (comb == 2u) return c.y;
+    if (comb == 3u) return c.y * c.y;
+    if (comb == 4u) return 0.5 * (c.x + c.y);
+    if (comb == 5u) return 0.5 * dot(c, c);
+    if (comb == 6u) return min(length(c), 1.0);
+    if (comb == 7u) return min(c.x, c.y);
+    if (comb == 8u) return max(c.x, c.y);
+    if (comb == 9u) return 0.5 * (0.5 * (c.x + c.y) + min(length(c), 1.0));
+    return 0.0;
+}
+
+vec4 proctex() {
+    uint tc = BITS(c_texconfig, 8, 2);
+    vec2 c = tc == 0u ? texcoord0 : tc == 1u ? texcoord1 : texcoord2;
+    if (BITSET(c_proctex, 15)) {
+        c.x += noiseU.ampl * texture(proctexNoiseLut, (c.x + noiseU.phase) / noiseU.freq).r;
+        c.y += noiseV.ampl * texture(proctexNoiseLut, (c.y + noiseV.phase) / noiseV.freq).r;
+    }
+    c.x = ptclamp(c.x, BITS(c_proctex, 0, 3));
+    c.y = ptclamp(c.y, BITS(c_proctex, 3, 3));
+    vec4 r = texture(tex3, texture(proctexMapLut, ptcombine(c, BITS(c_proctex, 6, 4))).r);
+    if (BITSET(c_proctex, 14)) {
+        r.a = texture(tex3, texture(proctexMapLut, ptcombine(c, BITS(c_proctex, 10, 4))).g).a;
+    }
+    return r;
+}
+
+vec4 tevsrc(int i, int src) {
+    if (src == 0) return color;
+    if (src == 1) return lprimary;
+    if (src == 2) return lsecondary;
+    if (src == 3) return tex0c;
+    if (src == 4) return tex1c;
+    if (src == 5) return tex2c;
+    if (src == 6) return tex3c;
+    if (src == 13) return buf;
+    if (src == 14) return tev_color[i];
+    if (src == 15) return cur;
+    return vec4(0.0);
+}
+
+vec3 oprgb(vec4 s, int op) {
+    if (op == 1) return 1.0 - s.rgb;
+    if (op == 2) return s.aaa;
+    if (op == 3) return 1.0 - s.aaa;
+    if (op == 4) return s.rrr;
+    if (op == 5) return 1.0 - s.rrr;
+    if (op == 8) return s.ggg;
+    if (op == 9) return 1.0 - s.ggg;
+    if (op == 12) return s.bbb;
+    if (op == 13) return 1.0 - s.bbb;
+    return s.rgb;
+}
+
+float opa(vec4 s, int op) {
+    if (op == 1) return 1.0 - s.a;
+    if (op == 2) return s.r;
+    if (op == 3) return 1.0 - s.r;
+    if (op == 4) return s.g;
+    if (op == 5) return 1.0 - s.g;
+    if (op == 6) return s.b;
+    if (op == 7) return 1.0 - s.b;
+    return s.a;
+}
+
+vec3 combrgb(int i) {
+    int c = tev[i].rgb.combiner;
+    vec3 s0 = oprgb(tevsrc(i, tev[i].rgb.src0), tev[i].rgb.op0);
+    if (c == 0 || c > 9) return s0;
+    vec3 s1 = oprgb(tevsrc(i, tev[i].rgb.src1), tev[i].rgb.op1);
+    if (c == 1) return s0 * s1;
+    if (c == 2) return min(s0 + s1, 1.0);
+    if (c == 3) return clamp(s0 + s1 - 0.5, 0.0, 1.0);
+    if (c == 5) return max(s0 - s1, 0.0);
+    if (c == 6 || c == 7) return max(vec3(4.0 * dot(s0 - 0.5, s1 - 0.5)), 0.0);
+    vec3 s2 = oprgb(tevsrc(i, tev[i].rgb.src2), tev[i].rgb.op2);
+    if (c == 4) return mix(s1, s0, s2);
+    if (c == 8) return min(s0 * s1 + s2, 1.0);
+    return min(s0 + s1, 1.0) * s2;
+}
+
+float comba(int i) {
+    int c = tev[i].a.combiner;
+    float s0 = opa(tevsrc(i, tev[i].a.src0), tev[i].a.op0);
+    if (c == 0 || c > 9) return s0;
+    float s1 = opa(tevsrc(i, tev[i].a.src1), tev[i].a.op1);
+    if (c == 1) return s0 * s1;
+    if (c == 2) return min(s0 + s1, 1.0);
+    if (c == 3) return clamp(s0 + s1 - 0.5, 0.0, 1.0);
+    if (c == 5) return max(s0 - s1, 0.0);
+    if (c == 6 || c == 7) return max(4.0 * (s0 - 0.5) * (s1 - 0.5), 0.0);
+    float s2 = opa(tevsrc(i, tev[i].a.src2), tev[i].a.op2);
+    if (c == 4) return mix(s1, s0, s2);
+    if (c == 8) return min(s0 * s1 + s2, 1.0);
+    return min(s0 + s1, 1.0) * s2;
+}
+
+bool alphatest_pass(float a) {
+    if (c_alphafunc == 0) return false;
+    if (c_alphafunc == 2) return a == alpharef;
+    if (c_alphafunc == 3) return a != alpharef;
+    if (c_alphafunc == 4) return a < alpharef;
+    if (c_alphafunc == 5) return a <= alpharef;
+    if (c_alphafunc == 6) return a > alpharef;
+    if (c_alphafunc == 7) return a >= alpharef;
+    return true;
+}
+
+void main() {
+    tex0c = vec4(0.0);
+    if (BITSET(c_texconfig, 0)) {
+        // a shadow map (type 2) needs the other sampler on the same unit, which
+        // one program cannot have: the renderer waits for the exact program
+        if (c_tex0type == 0) tex0c = texture(tex0, texcoord0);
+        else if (c_tex0type == 1 || c_tex0type == 4) tex0c = vec4(1.0);
+        else if (c_tex0type == 3) tex0c = textureProj(tex0, vec3(texcoord0, texcoordw));
+    }
+    tex1c = BITSET(c_texconfig, 1) ? texture(tex1, texcoord1) : vec4(0.0);
+    tex2c = BITSET(c_texconfig, 2)
+        ? texture(tex2, BITSET(c_texconfig, 13) ? texcoord1 : texcoord2) : vec4(0.0);
+    tex3c = BITSET(c_texconfig, 10) ? proctex() : vec4(0.0);
+
+    lprimary = vec4(0.0);
+    lsecondary = vec4(0.0);
+    if (c_lightDisable == 0) lighting();
+
+    cur = vec4(0.0);
+    buf = tev_buffer_color;
+    for (int i = 0; i < 6; i++) {
+        vec4 tmp;
+        tmp.rgb = combrgb(i);
+        if (tev[i].rgb.combiner == 7) tmp.a = tmp.r;
+        else tmp.a = comba(i);
+        if (i > 0) {
+            if (BITSET(BITS(c_tevbuf, 8, 4), i - 1)) buf.rgb = cur.rgb;
+            if (BITSET(BITS(c_tevbuf, 12, 4), i - 1)) buf.a = cur.a;
+        }
+        cur = tmp;
+        if (tev[i].rgb.scale != 1.0) cur.rgb = min(cur.rgb * tev[i].rgb.scale, 1.0);
+        if (tev[i].a.scale != 1.0) cur.a = min(cur.a * tev[i].a.scale, 1.0);
+    }
+
+    fragclr = clamp(cur, 0.0, 1.0);
+
+    if (c_alphatest != 0 && !alphatest_pass(fragclr.a)) discard;
+
+    if (BITS(c_tevbuf, 0, 3) == 5u) {
+        float fc = gl_FragCoord.z * 128.0 / 129.0 + 0.5 / 129.0;
+        if (BITSET(c_tevbuf, 16)) fc = 1.0 - fc;
+        float fog = texture(fogLut, fc).r;
+        fragclr.rgb = mix(fog_color.rgb, fragclr.rgb, fog);
+    }
+}
+)";
+
+char* shader_gen_uber_fs(void) {
+    DynString s;
+    ds_init(&s, 32768);
+    ds_printf(&s, "%s", fs_header);
+    ds_printf(&s, "%s", fs_uber_body);
+    return s.str;
+}
+
 char* shader_gen_fs(FragConfig* fcfg) {
     DynString s;
     ds_init(&s, 8192);

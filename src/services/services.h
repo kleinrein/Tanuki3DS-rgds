@@ -18,6 +18,7 @@
 #include "ir.h"
 #include "ldr.h"
 #include "mic.h"
+#include "nfc.h"
 #include "nwm.h"
 #include "ptm.h"
 #include "y2r.h"
@@ -38,6 +39,7 @@ typedef struct {
     MICData mic;
     CAMData cam;
     CSNDData csnd;
+    NFCData nfc;
 
 } ServiceData;
 

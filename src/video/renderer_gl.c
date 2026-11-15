@@ -168,10 +168,9 @@ void renderer_gl_init(GLState* state, GPU* gpu) {
     glShaderSource(state->gpu_vs, 1, &(const char*) {gpuvertsource}, nullptr);
     glCompileShader(state->gpu_vs);
 
-    state->gpu_uberfs = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(state->gpu_uberfs, 1, &(const char*) {gpufragsource},
-                   nullptr);
-    glCompileShader(state->gpu_uberfs);
+    // the uber fragment shader is generated (shader_gen_uber_fs) and built
+    // with the other programs; hostshaders/gpu.frag is the old one, unused
+    state->gpu_uberfs = 0;
 
     LRU_init(state->progcache);
     prog_builder_start();
@@ -456,7 +455,12 @@ static int (*g_pset_busy)(int* out);
 static int g_pset_write = -1, g_pset_screen[2] = {-1, -1};
 
 void gpu_gl_present_direct(bool on, int (*busy)(int* out)) {
-    g_pset_direct = on && !getenv("SPIKE_PRESENT_COPY");
+    // Off since 2026-11-05: with it the top panel showed the bottom screen's picture for single
+    // frames, about once a second in a Mario Kart 7 race (13 of 335 captured frames against 0 of
+    // 338 with the copy), which is the blinking the owner saw. The cause is not found: the set
+    // bookkeeping gives each screen its own texture, yet the top panel's draw sampled the bottom
+    // one. SPIKE_PRESENT_DIRECT=1 turns it back on for looking into that.
+    g_pset_direct = on && getenv("SPIKE_PRESENT_DIRECT") && !getenv("SPIKE_PRESENT_COPY");
     g_pset_busy = busy;
 }
 
@@ -757,6 +761,10 @@ typedef struct ProgSrc {
     char* src;
     bool ondisk;
     struct ProgSrc* next;
+    // the first source with this text; programs and the list only know that one
+    struct ProgSrc* canon;
+    u64 thash;
+    struct ProgSrc* tnext;
 } ProgSrc;
 
 typedef struct ProgEnt {
@@ -776,12 +784,16 @@ int g_prog_ready, g_prog_total, g_prog_cold;
 static struct {
     ProgSrc* vsrc[PROG_BUCKETS];
     ProgSrc* fsrc[PROG_BUCKETS];
+    ProgSrc* vtext[PROG_BUCKETS];
+    ProgSrc* ftext[PROG_BUCKETS];
     ProgEnt* prog[PROG_BUCKETS];
     pthread_t thread;
     pthread_mutex_t lock;
     pthread_cond_t wake, done;
     ProgEnt** hot;
     int nhot, caphot;
+    ProgEnt** warm; // uber programs: built first
+    int nwarm, capwarm;
     ProgEnt** cold;
     int ncold, coldpos;
     bool on;
@@ -795,20 +807,46 @@ static struct {
           .wake = PTHREAD_COND_INITIALIZER,
           .done = PTHREAD_COND_INITIALIZER};
 
+// Many configurations generate the same text: Mario Kart 7's 617 fragment
+// configurations are 255 texts and its 49 vertex shaders 15, so 911 pairs are
+// 269 programs. Sources with the same text share the first one's programs;
+// both functions return that first one. SPIKE_NOTEXTSHARE=1 turns it off.
+int g_src_shared;
+
 static ProgSrc* src_find(ProgSrc** tab, u64 hash) {
     for (ProgSrc* p = tab[hash % PROG_BUCKETS]; p; p = p->next) {
-        if (p->hash == hash) return p;
+        if (p->hash == hash) return p->canon;
     }
     return nullptr;
 }
 
 static ProgSrc* src_add(ProgSrc** tab, u64 hash, char* src, bool ondisk) {
+    static int share = -1;
+    if (share < 0) share = !getenv("SPIKE_NOTEXTSHARE");
     ProgSrc* p = calloc(1, sizeof *p);
     p->hash = hash;
     p->src = src;
     p->ondisk = ondisk;
+    p->canon = p;
     p->next = tab[hash % PROG_BUCKETS];
     tab[hash % PROG_BUCKETS] = p;
+    if (!share) return p;
+
+    u64 th = 0xcbf29ce484222325ull;
+    for (const u8* c = (const u8*) src; *c; c++) th = (th ^ *c) * 0x100000001b3ull;
+    p->thash = th;
+    ProgSrc** ttab = tab == g_pb.vsrc ? g_pb.vtext : g_pb.ftext;
+    for (ProgSrc* t = ttab[th % PROG_BUCKETS]; t; t = t->tnext) {
+        if (t->thash == th && !strcmp(t->src, src)) {
+            p->canon = t;
+            p->src = t->src;
+            free(src);
+            g_src_shared++;
+            return t;
+        }
+    }
+    p->tnext = ttab[th % PROG_BUCKETS];
+    ttab[th % PROG_BUCKETS] = p;
     return p;
 }
 
@@ -848,6 +886,13 @@ static void prog_build(ProgEnt* e, bool helper) {
     GLuint vs = compile_shader(GL_VERTEX_SHADER, e->v->src);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, e->f->src);
     GLuint prog = link_program(vs, fs, e->v == g_pb.sw_vs, e->f == g_pb.uber_fs);
+    {
+        // test hook: SPIKE_SLOWLINK=ms makes every exact program take that long, as a new
+        // one does on the handheld without the Mesa disk cache
+        static int slow = -1;
+        if (slow < 0) slow = getenv("SPIKE_SLOWLINK") ? atoi(getenv("SPIKE_SLOWLINK")) : 0;
+        if (slow && e->f != g_pb.uber_fs) usleep(slow * 1000);
+    }
     glDetachShader(prog, vs);
     glDetachShader(prog, fs);
     glDeleteShader(vs);
@@ -896,7 +941,13 @@ static void* prog_helper(void*) {
         pthread_mutex_lock(&g_pb.lock);
         ProgEnt* e = nullptr;
         while (!e) {
-            if (g_pb.nhot) {
+            // uber programs first: one of them frees every draw of its vertex
+            // shader from waiting, where an exact program frees one material
+            if (g_pb.nwarm) {
+                e = g_pb.warm[0];
+                memmove(g_pb.warm, g_pb.warm + 1,
+                        --g_pb.nwarm * sizeof g_pb.warm[0]);
+            } else if (g_pb.nhot) {
                 e = g_pb.hot[0];
                 memmove(g_pb.hot, g_pb.hot + 1,
                         --g_pb.nhot * sizeof g_pb.hot[0]);
@@ -936,6 +987,33 @@ static ProgEnt* prog_request(ProgSrc* v, ProgSrc* f) {
     }
     pthread_mutex_unlock(&g_pb.lock);
     return e;
+}
+
+// While a program is being built its draws use the uber program of the same
+// vertex shader: one fragment shader that reads the configuration from a
+// uniform block (slow, but only for the quarter second the exact one takes).
+// Before this a new program in a race was a 250 ms freeze. Each vertex shader's
+// uber program is asked for as soon as the vertex shader is known.
+// SPIKE_NOUBER=1 waits as before, SPIKE_UBERONLY=1 draws everything with it.
+int g_uber_draws;
+static int g_uber_on = -1;
+
+static void prog_want_uber(ProgSrc* v) {
+    if (!g_pb.on || g_uber_on <= 0) return;
+    ProgEnt* e = prog_find(v, g_pb.uber_fs);
+    if (!e) e = prog_add(v, g_pb.uber_fs, false);
+    if (atomic_load_explicit(&e->state, memory_order_acquire) != 0) return;
+    pthread_mutex_lock(&g_pb.lock);
+    if (!e->hot && atomic_load(&e->state) == 0) {
+        e->hot = true;
+        if (g_pb.nwarm == g_pb.capwarm) {
+            g_pb.capwarm = g_pb.capwarm ? g_pb.capwarm * 2 : 64;
+            g_pb.warm = realloc(g_pb.warm, g_pb.capwarm * sizeof g_pb.warm[0]);
+        }
+        g_pb.warm[g_pb.nwarm++] = e;
+        pthread_cond_signal(&g_pb.wake);
+    }
+    pthread_mutex_unlock(&g_pb.lock);
 }
 
 static void prog_wait(ProgEnt* e) {
@@ -1008,7 +1086,8 @@ static void prog_list_load(const char* path) {
         }
     }
     g_prog_cold = g_pb.ncold;
-    fprintf(stderr, "spike program list %s: %d programs\n", path, g_pb.ncold);
+    fprintf(stderr, "spike program list %s: %d programs, %d sources shared by text\n", path,
+            g_pb.ncold, g_src_shared);
 }
 
 static void prog_builder_start() {
@@ -1016,7 +1095,9 @@ static void prog_builder_start() {
     if (started) return;
     started = true;
     g_pb.sw_vs = src_add(g_pb.vsrc, 1, (char*) gpuvertsource, true);
-    g_pb.uber_fs = src_add(g_pb.fsrc, 1, (char*) gpufragsource, true);
+    g_pb.uber_fs = src_add(g_pb.fsrc, 1, shader_gen_uber_fs(), true);
+    g_uber_on = !getenv("SPIKE_NOUBER");
+    if (getenv("SPIKE_UBERONLY")) ctremu.ubershader = true;
     if (ctremu.romfilenoext && !getenv("SPIKE_NOPROGLIST")) {
         mkdir("shaders", 0777);
         char* path;
@@ -1026,6 +1107,11 @@ static void prog_builder_start() {
     }
     if (gpu_gl_helper_bind && !getenv("SPIKE_NOASYNC")) {
         g_pb.on = true;
+        for (int b = 0; b < PROG_BUCKETS; b++) {
+            for (ProgSrc* v = g_pb.vsrc[b]; v; v = v->next) {
+                if (v->canon == v) prog_want_uber(v);
+            }
+        }
         pthread_create(&g_pb.thread, nullptr, prog_helper, nullptr);
     }
 }
@@ -3081,8 +3167,6 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
 
     ProgSrc* fsrc;
     if (ctremu.ubershader) {
-        gls_BindBuffer(GL_UNIFORM_BUFFER, gpu->gl.uber_ubo);
-        glBufferData(GL_UNIFORM_BUFFER, sizeof fcfg, &fcfg, GL_STREAM_DRAW);
         fsrc = g_pb.uber_fs;
     } else {
         u64 hash = gpu_hash_fs(&fcfg);
@@ -3098,17 +3182,51 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         pe = prog_request(vsrc, fsrc);
         g_pb.cur = pe;
         g_pb.bound = false;
+        prog_want_uber(vsrc);
     }
-    if (atomic_load_explicit(&pe->state, memory_order_acquire) != 2) prog_wait(pe);
-    GLuint prog = pe->prog;
-    if (!g_pb.bound) {
+    // the program this draw uses: the exact one, or the uber one of the same
+    // vertex shader while the exact one is still building
+    ProgEnt* use = pe;
+    if (atomic_load_explicit(&pe->state, memory_order_acquire) != 2) {
+        ProgEnt* ue = nullptr;
+        // a shadow map needs the shadow sampler on unit 0, which the uber
+        // program cannot have beside the plain one
+        // One screen-sized layer costs the Mali 24 ms with the uber shader (0.3 ms with an
+        // exact one), and a frame drawn wholly with it does not finish before the kernel's
+        // 500 ms job timeout. So it stands in for a new material or two in the middle of
+        // play; a burst of them (a track loading) waits for the exact programs as before.
+        if (g_uber_on > 0 && fsrc != g_pb.uber_fs && g_pb.nhot <= 2 &&
+            !(fcfg.texconfig.tex0enable && fcfg.tex0type == 2)) {
+            ue = prog_find(vsrc, g_pb.uber_fs);
+            if (ue && atomic_load_explicit(&ue->state, memory_order_acquire) != 2) ue = nullptr;
+        }
+        if (ue) {
+            use = ue;
+            g_uber_draws++;
+        } else {
+            prog_wait(pe);
+        }
+    }
+    if (use->f == g_pb.uber_fs) {
+        static_assert(sizeof fcfg <= FRAGCONFIG_BLOCK_SIZE);
+        u8 cbuf[FRAGCONFIG_BLOCK_SIZE] = {};
+        memcpy(cbuf, &fcfg, sizeof fcfg);
+        size_t uoff = stream_put(GL_UNIFORM_BUFFER, cbuf, sizeof cbuf, g_ubo_align);
+        gls_BindBufferRange(GL_UNIFORM_BUFFER, 1, g_stream, uoff, sizeof cbuf);
+    }
+    GLuint prog = use->prog;
+    if (use != pe) {
+        // the next draw looks again: the exact program may be ready by then
+        glUseProgram(prog);
+        g_pb.bound = false;
+    } else if (!g_pb.bound) {
         glUseProgram(prog);
         g_pb.bound = true;
     }
     {
         typeof(&g_depth_uni[0]) u = &g_depth_uni[prog & 8191];
         if (!u->known) {
-            memcpy(u->loc, pe->depthloc, sizeof u->loc);
+            memcpy(u->loc, use->depthloc, sizeof u->loc);
             u->known = true;
             u->sent = false;
         }

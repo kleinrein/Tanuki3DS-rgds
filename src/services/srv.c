@@ -22,7 +22,7 @@ struct {
     SRV("ir:USER", ir_user), SRV("am:app", am),        SRV("frd:u", frd),
     SRV("ptm:u", ptm),       SRV("ptm:play", ptm),     SRV("ptm:sysm", ptm),
     SRV("boss:U", boss),     SRV("mic:u", mic),        SRV("cam:u", cam),
-    SRV("csnd:SND", csnd)
+    SRV("csnd:SND", csnd),   SRV("nfc:u", nfc),        SRV("nfc:m", nfc)
 #undef SRV
 };
 
@@ -73,6 +73,9 @@ void services_init(E3DS* s) {
     }
 
     srvobj_init(&s->services.cecd.cecinfo.hdr, KOT_EVENT);
+
+    srvobj_init(&s->services.nfc.in_range.hdr, KOT_EVENT);
+    srvobj_init(&s->services.nfc.out_of_range.hdr, KOT_EVENT);
 
     srvobj_init(&s->services.y2r.transferend.hdr, KOT_EVENT);
 

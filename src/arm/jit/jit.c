@@ -75,12 +75,50 @@ static bool jl_mark(const JitListEnt* e) {
     }
 }
 
+// entry number + 1 by address, to ask whether a link target is on the list
+static u32* g_jl_byaddr;
+
+static u32 jl_slot(u32 addr) {
+    return (addr * 0x9e3779b1u) >> (32 - JL_SEEN_BITS);
+}
+
 static void jl_push(const JitListEnt* e) {
     if (g_jl.n == g_jl.cap) {
         g_jl.cap = g_jl.cap ? g_jl.cap * 2 : 4096;
         g_jl.d = realloc(g_jl.d, g_jl.cap * sizeof *g_jl.d);
     }
+    u32 mask = BIT(JL_SEEN_BITS) - 1;
+    for (u32 i = jl_slot(e->addr);; i = (i + 1) & mask) {
+        if (!g_jl_byaddr[i]) {
+            g_jl_byaddr[i] = g_jl.n + 1;
+            break;
+        }
+    }
     g_jl.d[g_jl.n++] = *e;
+}
+
+// Compiling ahead only the listed block is known to be the code that ran before: its hash says so.
+// What it branches to is compiled along with it for the link, and that can be anything, another
+// module's data included (Super Smash Bros. crashed in the optimiser on such blocks). So ahead of
+// time a block links only to what is compiled already or is on the list with its hash matching; the
+// rest goes through the dispatcher, which puts it on the list for the next run.
+int g_jit_pre_nolink;
+bool jit_link_ok(ArmCore* cpu, u32 attrs, u32 addr) {
+    if (!g_jl.preloading) return true;
+    if (cpu->jit_cache[attrs] && cpu->jit_cache[attrs][addr >> 16] &&
+        cpu->jit_cache[attrs][addr >> 16][(addr & 0xffff) >> 1]) {
+        return true;
+    }
+    u32 mask = BIT(JL_SEEN_BITS) - 1;
+    for (u32 i = jl_slot(addr); g_jl_byaddr[i]; i = (i + 1) & mask) {
+        JitListEnt* e = &g_jl.d[g_jl_byaddr[i] - 1];
+        if (e->addr == addr && (e->attrs_len & 0xff) == attrs &&
+            XXH3_64bits(ctremu.system.virtmem + addr, e->attrs_len >> 8) == e->hash) {
+            return true;
+        }
+    }
+    g_jit_pre_nolink++;
+    return false;
 }
 
 static u32 jl_len(JITBlock* block) {
@@ -106,6 +144,7 @@ static void jl_record(JITBlock* block) {
 
 void jit_list_start(const char* rom) {
     g_jl.seen = calloc(BIT(JL_SEEN_BITS), sizeof(u64));
+    g_jl_byaddr = calloc(BIT(JL_SEEN_BITS), sizeof(u32));
     g_jl.on = true;
     mkdir("jit", 0777);
     char* path;
@@ -305,6 +344,8 @@ JITBlock* get_jitblock(ArmCore* cpu, u32 attrs, u32 addr) {
         if (!depth++) clock_gettime(CLOCK_MONOTONIC, &ts0);
         block = create_jit_block(cpu, addr);
         g_jit_blocks++;
+        // link targets too, or a later run could not link to them ahead of time
+        if (!g_jl.preloading) jl_record(block);
         if (!--depth) {
             clock_gettime(CLOCK_MONOTONIC, &ts1);
             u64 ns = (ts1.tv_sec - ts0.tv_sec) * 1000000000ull + ts1.tv_nsec - ts0.tv_nsec;
@@ -312,7 +353,6 @@ JITBlock* get_jitblock(ArmCore* cpu, u32 attrs, u32 addr) {
                 g_jit_ns += ns;
                 g_jit_roots++;
                 if (ns > g_jit_max) g_jit_max = ns;
-                jl_record(block);
             }
         }
         cpu->cpsr.jitattrs = old;

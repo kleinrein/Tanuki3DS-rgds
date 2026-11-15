@@ -47,6 +47,7 @@ JITBlock* get_jitblock(ArmCore* cpu, u32 attrs, u32 addr);
 
 void jit_invalidate_range(ArmCore* cpu, u32 start_addr, u32 len);
 bool jit_addr_mapped(u32 addr);
+bool jit_link_ok(ArmCore* cpu, u32 attrs, u32 addr);
 void jit_list_start(const char* rom);
 void jit_list_step(ArmCore* cpu, u64 budget_ns);
 void jit_free_all(ArmCore* cpu);

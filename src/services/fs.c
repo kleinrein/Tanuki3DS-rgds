@@ -34,10 +34,9 @@ u8 country_list[] = {
 };
 
 void sanitize_filepath(char* s) {
-    // windows forbids a bunch of characters in filepaths
-    // so we replace them here
-    // on non-windows this isnt a problem so we do nothing
-#ifdef _WIN32
+    // windows forbids a bunch of characters in filepaths, and so does
+    // exFAT, which is what the handheld keeps saves on: a title with a
+    // colon got no save folder there. replace them everywhere
     for (char* p = s; *p; p++) {
         switch (*p) {
             case '<':
@@ -50,7 +49,6 @@ void sanitize_filepath(char* s) {
                 *p = ' ';
         }
     }
-#endif
 }
 
 char* archive_basepath(E3DS* s, u64 archive) {
@@ -149,6 +147,19 @@ FILE* open_formatinfo(E3DS* s, u64 archive, bool write) {
     free(fipath);
     free(basepath);
     return fp;
+}
+
+// a format info file that could not be opened must not take the game down
+static void put_formatinfo(FILE* fp, u32 numfiles, u32 numdirs,
+                           bool duplicate) {
+    if (!fp) {
+        lerror("could not write format info");
+        return;
+    }
+    fwrite(&numfiles, sizeof(u32), 1, fp);
+    fwrite(&numdirs, sizeof(u32), 1, fp);
+    fwrite(&duplicate, sizeof(bool), 1, fp);
+    fclose(fp);
 }
 
 char* create_text_path(E3DS* s, u64 archive, u32 pathtype, void* rawpath,
@@ -382,10 +393,7 @@ DECL_PORT(fs) {
             linfo("FormatThisUserSaveData");
 
             FILE* fp = open_formatinfo(s, ARCHIVE_SAVEDATA, true);
-            fwrite(&cmdbuf[3], sizeof(u32), 1, fp);
-            fwrite(&cmdbuf[2], sizeof(u32), 1, fp);
-            fwrite(&cmdbuf[6], sizeof(bool), 1, fp);
-            fclose(fp);
+            put_formatinfo(fp, cmdbuf[3], cmdbuf[2], (u8) cmdbuf[6]);
 
             cmdbuf[0] = IPCHDR(1, 0);
             cmdbuf[1] = 0;
@@ -400,10 +408,7 @@ DECL_PORT(fs) {
                   numdirs);
 
             FILE* fp = open_formatinfo(s, ARCHIVE_SYSTEMSAVEDATA, true);
-            fwrite(&numfiles, sizeof(u32), 1, fp);
-            fwrite(&numdirs, sizeof(u32), 1, fp);
-            fwrite(&duplicate, sizeof(bool), 1, fp);
-            fclose(fp);
+            put_formatinfo(fp, numfiles, numdirs, duplicate);
 
             cmdbuf[0] = IPCHDR(1, 0);
             cmdbuf[1] = 0;
@@ -494,10 +499,7 @@ DECL_PORT(fs) {
 
             FILE* fp = open_formatinfo(
                 s, fs_open_archive(s, archive, pathtype, path), true);
-            fwrite(&numfiles, sizeof(u32), 1, fp);
-            fwrite(&numdirs, sizeof(u32), 1, fp);
-            fwrite(&duplicate, sizeof(bool), 1, fp);
-            fclose(fp);
+            put_formatinfo(fp, numfiles, numdirs, duplicate);
 
             cmdbuf[0] = IPCHDR(1, 0);
             cmdbuf[1] = 0;
@@ -512,10 +514,7 @@ DECL_PORT(fs) {
                   numdirs);
 
             FILE* fp = open_formatinfo(s, ARCHIVE_EXTSAVEDATA, true);
-            fwrite(&numfiles, sizeof(u32), 1, fp);
-            fwrite(&numdirs, sizeof(u32), 1, fp);
-            fwrite(&(bool) {0}, sizeof(bool), 1, fp);
-            fclose(fp);
+            put_formatinfo(fp, numfiles, numdirs, (bool) {0});
 
             cmdbuf[0] = IPCHDR(1, 0);
             cmdbuf[1] = 0;
@@ -531,10 +530,7 @@ DECL_PORT(fs) {
                   numdirs);
 
             FILE* fp = open_formatinfo(s, ARCHIVE_SYSTEMSAVEDATA, true);
-            fwrite(&numfiles, sizeof(u32), 1, fp);
-            fwrite(&numdirs, sizeof(u32), 1, fp);
-            fwrite(&duplicate, sizeof(bool), 1, fp);
-            fclose(fp);
+            put_formatinfo(fp, numfiles, numdirs, duplicate);
 
             cmdbuf[0] = IPCHDR(1, 0);
             cmdbuf[1] = 0;
@@ -929,10 +925,7 @@ u64 fs_open_archive(E3DS* s, u32 id, u32 pathtype, void* path) {
                 if (fp) fclose(fp);
                 else {
                     fp = open_formatinfo(s, aid, true);
-                    fwrite(&(u32) {255}, sizeof(u32), 1, fp);
-                    fwrite(&(u32) {255}, sizeof(u32), 1, fp);
-                    fwrite(&(bool) {false}, sizeof(bool), 1, fp);
-                    fclose(fp);
+                    put_formatinfo(fp, (u32) {255}, (u32) {255}, (bool) {false});
                 }
                 return aid;
             } else {

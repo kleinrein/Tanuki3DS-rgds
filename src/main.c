@@ -258,6 +258,7 @@ static void spike_frame_done(int w, int h) {
 
 extern u64 g_jit_ns, g_jit_max;
 extern int g_jit_dispatches, g_jit_disp_c, g_jit_disp_evict;
+extern int g_uber_draws;
 extern int g_jit_blocks, g_jit_roots;
 extern u64 g_jit_pre_ns;
 extern int g_jit_pre_roots, g_jit_pre_blocks;
@@ -1511,7 +1512,7 @@ int main(int argc, char** argv) {
                             "progwait %.0f progs %d/%d jit %d/%d ms %.1f max %.1f "
                             "pre %d/%d ms %.1f arena %.1f swaps %.1f+%.1f %.1f+%.1f lost %d "
                             "texdiff %d tiles %d ms %.0f new/stale/rehash %d/%d/%d "
-                            "pt %d/%d/%d gap %.0f flips %d/%d/%d lit %d gpu %.1f glcalls %d/%d relaid %d disp %d/%d/%d\n",
+                            "pt %d/%d/%d gap %.0f flips %d/%d/%d lit %d gpu %.1f glcalls %d/%d relaid %d disp %d/%d/%d uber %d\n",
                             busy / n, present / n, wait / n, copies, wraps,
                             gpu_worker_drawn(), n, g_lut_misses, gpu_worker_transfers(),
                             g_draws / (n ? n : 1), g_tex_creates, g_tex_partial,
@@ -1536,8 +1537,9 @@ int main(int argc, char** argv) {
                             g_gpu_n ? g_gpu_ns / 1e6 / g_gpu_n : 0.0,
                             g_gls_calls - g_gls_skipped, g_gls_calls, g_draws_relaid,
                             g_jit_dispatches / (n ? n : 1), g_jit_disp_c / (n ? n : 1),
-                            g_jit_disp_evict / (n ? n : 1));
+                            g_jit_disp_evict / (n ? n : 1), g_uber_draws);
                     g_jit_dispatches = g_jit_disp_c = g_jit_disp_evict = 0;
+                    g_uber_draws = 0;
                     g_gls_calls = g_gls_skipped = 0;
                     g_draws_relaid = 0;
                     g_draws_lit = 0;

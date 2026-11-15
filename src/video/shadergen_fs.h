@@ -197,5 +197,10 @@ typedef struct _FSHCacheEntry {
 } FSHCacheEntry;
 
 char* shader_gen_fs(FragConfig* fcfg);
+// one shader for every configuration, which it reads from the FragConfig block
+char* shader_gen_uber_fs(void);
+// what the FragConfig block of that shader takes: the struct, padded to the
+// block's std140 size
+#define FRAGCONFIG_BLOCK_SIZE 592
 
 #endif

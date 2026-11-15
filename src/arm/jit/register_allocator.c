@@ -12,6 +12,14 @@ void find_uses(IRBlock* block, u32* vuses) {
     }
 }
 
+// spike: an operand that names an instruction without a result has no register to give back. Seen in
+// Super Smash Bros. while compiling ahead; say which block, so the translator can be fixed
+static void no_result(IRBlock* block, int i, u32 op) {
+    fprintf(stderr, "spike regalloc: block %08x-%08x instr %d (opcode %d) uses instr %u (opcode %d), which has no result\n",
+            block->start_addr, block->end_addr, i, block->code.d[i].opcode, op,
+            op < block->code.size ? (int) block->code.d[op].opcode : -1);
+}
+
 RegAllocation allocate_registers(IRBlock* block) {
     u32 vuses[block->code.size];
     find_uses(block, vuses);
@@ -27,12 +35,14 @@ RegAllocation allocate_registers(IRBlock* block) {
 
         if (!inst.imm1) {
             if (!--vuses[inst.op1]) {
-                reg_active.d[ret.reg_assn[inst.op1]] = false;
+                if (ret.reg_assn[inst.op1] == -1) no_result(block, i, inst.op1);
+                else reg_active.d[ret.reg_assn[inst.op1]] = false;
             }
         }
         if (!inst.imm2) {
             if (!--vuses[inst.op2]) {
-                reg_active.d[ret.reg_assn[inst.op2]] = false;
+                if (ret.reg_assn[inst.op2] == -1) no_result(block, i, inst.op2);
+                else reg_active.d[ret.reg_assn[inst.op2]] = false;
             }
         }
 

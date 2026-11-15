@@ -179,7 +179,8 @@ static u32 embedded(E3DS* s, KObject** e) {
         &v->hid.events[2].hdr,    &v->hid.events[3].hdr,    &v->hid.events[4].hdr,
         &v->cecd.cecinfo.hdr,     &v->y2r.transferend.hdr,  &v->ir.connection_status.hdr,
         &v->mic.event.hdr,        &v->cam.recvEvent.hdr,    &v->cam.vsyncEvent.hdr,
-        &v->cam.errEvent.hdr,     &v->csnd.shmem.hdr,
+        &v->cam.errEvent.hdr,     &v->csnd.shmem.hdr,       &v->nfc.in_range.hdr,
+        &v->nfc.out_of_range.hdr,
     };
     static_assert(countof(list) <= MAX_EMBEDDED);
     memcpy(e, list, sizeof list);
@@ -268,7 +269,7 @@ static const struct {
     PORT(csnd),    PORT(dsp),         PORT(errf),       PORT(frd),     PORT(fs),     PORT(fs_dir),
     PORT(fs_file), PORT(fs_selfncch), PORT(fs_sysfile), PORT(gsp_gpu), PORT(hid),    PORT(ir_user),
     PORT(ldr_ro),  PORT(mic),         PORT(nwm_uds),    PORT(ptm),     PORT(srv),    PORT(stub),
-    PORT(y2r),
+    PORT(y2r),     PORT(nfc),
 };
 
 void apt_resume_app(E3DS* s);
@@ -683,6 +684,8 @@ static void s_services(IO* io, E3DS* s) {
     S16(v->cam.x1);
     S16(v->cam.y1);
     S32(v->cam.dstAddr);
+
+    S8(v->nfc.state);
 }
 
 static void s_bufinfo(IO* io, BufInfo* b) {
