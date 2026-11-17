@@ -33,6 +33,9 @@ DECL_PORT(nfc) {
         case 0x0003:
         case 0x0004:
             linfo("Start/StopCommunication");
+            // a game resumed from a state that had no nfc service already
+            // called Initialize, before this engine could see it
+            if (nfc->state == NFC_NOTINIT) nfc->state = NFC_IDLE;
             cmdbuf[0] = IPCHDR(1, 0);
             cmdbuf[1] = 0;
             break;

@@ -11,6 +11,9 @@ void services_init(E3DS* s);
 
 u32 srvobj_make_handle(E3DS* s, KObject* o);
 
+// the handler for a service port name, or nullptr when this engine has none
+PortRequestHandler srv_find_handler(const char* name);
+
 DECL_PORT(srv);
 
 DECL_PORT(errf);

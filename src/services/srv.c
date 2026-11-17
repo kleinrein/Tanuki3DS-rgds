@@ -26,6 +26,12 @@ struct {
 #undef SRV
 };
 
+PortRequestHandler srv_find_handler(const char* name) {
+    for (int i = 0; i < countof(srvhandlers); i++)
+        if (!strcmp(name, srvhandlers[i].name)) return srvhandlers[i].handler;
+    return nullptr;
+}
+
 void srvobj_init(KObject* hdr, KObjType t) {
     hdr->type = t;
     hdr->refcount = 1;
@@ -124,13 +130,7 @@ DECL_PORT(srv) {
             char* name = (char*) &cmdbuf[1];
             name[cmdbuf[3]] = '\0';
 
-            PortRequestHandler handler = nullptr;
-            for (int i = 0; i < countof(srvhandlers); i++) {
-                if (!strcmp(name, srvhandlers[i].name)) {
-                    handler = srvhandlers[i].handler;
-                    break;
-                }
-            }
+            PortRequestHandler handler = srv_find_handler(name);
             u32 handle = handle_new(s);
             KSession* session;
             if (handler) {

@@ -779,13 +779,16 @@ void gpu_vbo_layout(const GPURegs* regs, int vbo, VboLayout* out) {
     out->changed = false;
     for (int c = 0; c < regs->geom.attrbuf[vbo].count; c++) {
         int attr = (regs->geom.attrbuf[vbo].comp >> 4 * c) & 0xf;
+        // the PICA starts each attribute at a multiple of its element size and
+        // pads in words from a word boundary (Smash's fighters mix u8x3 with s16)
         if (attr >= 0xc) {
-            inoff += 4 * (attr - 0xb);
+            inoff = ((inoff + 3) & ~3u) + 4 * (attr - 0xb);
             continue;
         }
         int fmt = (regs->geom.attr_format >> 4 * attr) & 0xf;
         int size = (fmt >> 2) + 1, type = fmt & 3, cs = typesize[type];
         int outsize = type == 2 && size == 3 ? 4 : size;
+        inoff = (inoff + cs - 1) & ~(u32) (cs - 1);
         off = (off + cs - 1) & ~(u32) (cs - 1);
         auto a = &out->a[out->n++];
         a->attr = attr;
@@ -1140,20 +1143,24 @@ void vtx_loader_setup(GPU* gpu, AttrConfig cfg) {
         u32 stride = gpu->regs.geom.attrbuf[vbo].size;
         for (int c = 0; c < gpu->regs.geom.attrbuf[vbo].count; c++) {
             int attr = (gpu->regs.geom.attrbuf[vbo].comp >> 4 * c) & 0xf;
+            // aligned like the hardware: see gpu_vbo_layout
             if (attr >= 0xc) {
-                vtx += 4 * (attr - 0xb);
+                vtx = (void*) (((uintptr_t) vtx + 3) & ~(uintptr_t) 3) + 4 * (attr - 0xb);
                 continue;
             }
             int fmt = (gpu->regs.geom.attr_format >> 4 * attr) & 0xf;
+
+            int size = (fmt >> 2) + 1;
+            int type = fmt & 3;
+            static const int typesize[4] = {1, 1, 2, 4};
+            int cs = typesize[type];
+            vtx = (void*) (((uintptr_t) vtx + cs - 1) & ~(uintptr_t) (cs - 1));
 
             cfg[attr].base = vtx;
             cfg[attr].stride = stride;
             cfg[attr].fmt = fmt;
 
-            int size = (fmt >> 2) + 1;
-            int type = fmt & 3;
-            static const int typesize[4] = {1, 1, 2, 4};
-            vtx += size * typesize[type];
+            vtx += size * cs;
         }
     }
 }

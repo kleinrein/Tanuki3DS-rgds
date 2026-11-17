@@ -379,6 +379,18 @@ static void s_object(IO* io, KObject* o) {
             auto ses = (KSession*) o;
             s_port(io, &ses->handler);
             S64(ses->arg);
+            // A state from an engine that lacked a service keeps a stub
+            // session for it (Smash's nfc:u answered "no reader" forever):
+            // hand it to the real service when this engine has one.
+            if (!io->writing && ses->handler == (PortRequestHandlerArg) port_handle_stub) {
+                char svc[9] = {};
+                memcpy(svc, &ses->arg, 8);
+                PortRequestHandler real = srv_find_handler(svc);
+                if (real) {
+                    fprintf(stderr, "state: service %s now handled by the engine\n", svc);
+                    ses->handler = (PortRequestHandlerArg) real;
+                }
+            }
             break;
         }
         default:

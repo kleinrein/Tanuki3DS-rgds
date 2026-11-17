@@ -40,6 +40,7 @@ static struct {
     char last_token[128], speed_token[128];
     Uint64 poll_at;
     atomic_bool show, capture_wanted;
+    bool captured[2]; // the panels written for the capture request in hand (renderer thread only)
     atomic_int fit, second, bar, shader;
     // the lid around the top screen ("" none): written between frames, read on the renderer thread
     char lid[32];
@@ -638,8 +639,8 @@ bool rgds_bridge_tick() {
     return g.held || g.job;
 }
 
-static void write_capture() {
-    // the save gallery's picture: 32-bit BMP, bottom row first as GL reads it
+static void write_capture(int panel) {
+    // the save gallery's picture (the top panel) and make shot's (both): 32-bit BMP, bottom row first as GL reads it
     static u8 px[PANEL_BYTES];
     glReadPixels(0, 0, 640, 480, GL_BGRA, GL_UNSIGNED_BYTE, px);
     for (int i = 3; i < PANEL_BYTES; i += 4) px[i] = 255;
@@ -654,7 +655,7 @@ static void write_capture() {
     head[26] = 1;
     head[28] = 32;
     char path[600], pending[640];
-    snprintf(path, sizeof path, "%s-top.bmp", g.capture);
+    snprintf(path, sizeof path, "%s-%s.bmp", g.capture, panel ? "bottom" : "top");
     snprintf(pending, sizeof pending, "%s.pending", path);
     FILE* f = fopen(pending, "wb");
     if (f) {
@@ -663,7 +664,6 @@ static void write_capture() {
         fclose(f);
         rename(pending, path);
     }
-    unlink(g.capture);
 }
 
 static GLuint compile_part(GLenum type, const char* src) {
@@ -790,7 +790,17 @@ extern void rgds_hud_draw(unsigned char* pixels, int volume, bool fast_forward, 
 
 void rgds_bridge_panel(int panel) {
     if (!g.on) return;
-    if (panel == 0 && atomic_exchange(&g.capture_wanted, false)) write_capture();
+    // A request is answered once both panels are written (the order the panels are drawn in may vary); the
+    // launcher's save gallery reads the top one, tools/device_shot.py waits for both.
+    if (atomic_load(&g.capture_wanted) && !g.captured[panel]) {
+        write_capture(panel);
+        g.captured[panel] = true;
+        if (g.captured[0] && g.captured[1]) {
+            g.captured[0] = g.captured[1] = false;
+            atomic_store(&g.capture_wanted, false);
+            unlink(g.capture);
+        }
+    }
     bool show = atomic_load(&g.show);
     if (!show) g.have_picture = false;
 
