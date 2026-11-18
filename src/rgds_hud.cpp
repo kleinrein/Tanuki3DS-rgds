@@ -15,6 +15,12 @@ extern "C" void rgds_hud_draw(unsigned char* pixels, int volume, bool fast_forwa
     if (fps >= 0) rgds::draw_fps_hud(pixels, fps, false);
 }
 
+// "Preparing graphics…" while a game waits for its first GPU programs: false without the launcher's font
+extern "C" bool rgds_hud_preparing(unsigned char* pixels, int tick) {
+    std::memset(pixels, 0, 640 * 480 * 4);
+    return rgds::hud::preparing(pixels, tick);
+}
+
 extern "C" const char* rgds_shader_file(int id) {
     return id > 0 && id < rgds::shader_count ? rgds::shader_files[id] : nullptr;
 }

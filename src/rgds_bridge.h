@@ -21,5 +21,8 @@ void rgds_crash_note(const char* what, void* addr, void* pc, void* lr);
 // The Graphics page's choices, on the renderer thread before a panel is drawn.
 int rgds_bridge_filter();
 void rgds_bridge_layout(int panel, Rect* top, Rect* bot);
+// On the present thread, while the game waits for its GPU programs: a dark panel, the top one with a
+// "Preparing graphics" card that `tick` animates.
+void rgds_bridge_preparing(int panel, int tick);
 
 #endif

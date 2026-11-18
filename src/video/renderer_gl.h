@@ -118,6 +118,7 @@ extern u32 g_vstream_presents;
 extern volatile int g_draw_dump;
 extern int g_lut_misses, g_tex_creates, g_tex_partial, g_draws, g_links, g_tex_same, g_tex_changed, g_tex_again;
 extern u64 g_ns_shaders, g_ns_compile, g_ns_textures, g_ns_progwait;
+extern _Atomic int g_prog_waiting;
 extern int g_tex_diffs, g_tex_difftiles, g_tex_new, g_tex_stalefull, g_tex_rehashfull, g_draws_lit, g_gls_skipped, g_gls_calls, g_draws_relaid;
 extern u64 g_ns_texdiff;
 void gpu_gl_shadows_drop(GPU* gpu);

@@ -69,6 +69,10 @@ static struct {
     int poll_count;
     GLuint hud_tex;
     u8* hud_pixels;
+    GLuint prep_tex;
+    u8* prep_pixels;
+    int prep_tick;
+    bool prep_ok;
     int hud_volume, hud_fast;
     double hud_fps, fps_shown;
     int fps_frames;
@@ -787,6 +791,45 @@ static bool panel_ground() {
 }
 
 extern void rgds_hud_draw(unsigned char* pixels, int volume, bool fast_forward, double fps);
+extern bool rgds_hud_preparing(unsigned char* pixels, int tick);
+
+void rgds_bridge_preparing(int panel, int tick) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, 640, 480);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (panel != 0) return;
+    overlay_program();
+    glActiveTexture(GL_TEXTURE0);
+    if (!g.prep_tex) {
+        g.prep_pixels = malloc(PANEL_BYTES);
+        g.prep_tick = -1;
+        glGenTextures(1, &g.prep_tex);
+        glBindTexture(GL_TEXTURE_2D, g.prep_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 480, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, g.prep_tex);
+    if (tick != g.prep_tick) {
+        g.prep_tick = tick;
+        g.prep_ok = rgds_hud_preparing(g.prep_pixels, tick);
+        if (tick == 1) fprintf(stderr, "preparing card: %s\n", g.prep_ok ? "drawn" : "no font, dark panels only");
+        if (g.prep_ok) glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 640, 480, GL_RGBA, GL_UNSIGNED_BYTE, g.prep_pixels);
+    }
+    if (!g.prep_ok) return;
+    glUseProgram(g.prog);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1i(g.use_tex, 1);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
+}
 
 void rgds_bridge_panel(int panel) {
     if (!g.on) return;

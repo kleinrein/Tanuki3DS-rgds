@@ -345,6 +345,8 @@ static struct {
     _Atomic int presented, dropped;
     _Atomic Uint64 maxgap;
     Uint64 last;
+    Uint64 started;           // when the present thread began, for the "Preparing graphics" card
+    int prep_tick;
     // spike: the cadence for games that present every other refresh (see present_main)
     Uint64 pending_t;         // when the renderer handed the pending frame over
     Uint64 flip0;             // when the first panel's last flip returned
@@ -434,6 +436,28 @@ static void present_cadence(Uint64 arrived) {
     }
 }
 
+// While a game waits for GPU programs (its first start, or a new driver's empty cache, can take tens of
+// seconds) nothing is presented and the panels stay dark, which looks like a hang. After half a second
+// without a picture, before the first one or while the renderer is held for a program, the present
+// thread shows "Preparing graphics" with a turning arc, about ten times a second, until the next frame.
+static void present_preparing() {
+    if (ctremu.pause || getenv("SPIKE_NOPREPARING")) return;
+    Uint64 now = SDL_GetTicksNS(), last = g_pt.last ? g_pt.last : g_pt.started;
+    if (now - last < 500 * SDL_NS_PER_MS) return;
+    if (atomic_load(&g_pt.presented) > 0 && atomic_load(&g_prog_waiting) == 0) return;
+    g_pt.prep_tick++;
+    for (int panel = 0; panel < 2; panel++) {
+        SDL_Window* window = panel ? g_window2 : g_window;
+        if (!window) continue;
+        SDL_GL_MakeCurrent(window, g_pt.ctx);
+        // a core context draws nothing without a vertex array: the game's frames bind this one, and before
+        // the first of them nothing has, so the card was dropped until the game's own picture came up
+        glBindVertexArray(g_pt.vao);
+        rgds_bridge_preparing(panel, g_pt.prep_tick);
+        SDL_GL_SwapWindow(window);
+    }
+}
+
 static void* present_main(void* arg) {
     pthread_setname_np(pthread_self(), "ctremu:present");
     if (getenv("SPIKE_PIN")) {
@@ -449,7 +473,20 @@ static void* present_main(void* arg) {
     glGenVertexArrays(1, &g_pt.vao);
     for (;;) {
         pthread_mutex_lock(&g_pt.mu);
-        while (g_pt.pending < 0) pthread_cond_wait(&g_pt.cv, &g_pt.mu);
+        while (g_pt.pending < 0) {
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_nsec += 100 * 1000000L;
+            if (until.tv_nsec >= 1000000000L) {
+                until.tv_sec++;
+                until.tv_nsec -= 1000000000L;
+            }
+            if (pthread_cond_timedwait(&g_pt.cv, &g_pt.mu, &until) == ETIMEDOUT && g_pt.pending < 0) {
+                pthread_mutex_unlock(&g_pt.mu);
+                present_preparing();
+                pthread_mutex_lock(&g_pt.mu);
+            }
+        }
         int sets[2] = {g_pt.pending_sets[0], g_pt.pending_sets[1]};
         int w = g_pt.pending_w, h = g_pt.pending_h;
         Uint64 arrived = g_pt.pending_t;
@@ -477,6 +514,7 @@ static void* present_main(void* arg) {
 static void present_thread_start() {
     if (!g_pt.ctx) return;
     gpu_gl_present_direct(true, present_busy_sets);
+    g_pt.started = SDL_GetTicksNS();
     pthread_create(&g_pt.thread, nullptr, present_main, nullptr);
     g_pt.on = true;
 }

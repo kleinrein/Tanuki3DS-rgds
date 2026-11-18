@@ -779,6 +779,8 @@ typedef struct ProgEnt {
 
 void (*gpu_gl_helper_bind)(void);
 u64 g_ns_progwait;
+// draws held for a program still being built; the present thread shows "Preparing graphics" meanwhile
+_Atomic int g_prog_waiting;
 int g_prog_ready, g_prog_total, g_prog_cold;
 
 static struct {
@@ -1018,11 +1020,13 @@ static void prog_want_uber(ProgSrc* v) {
 
 static void prog_wait(ProgEnt* e) {
     u64 t0 = diag_now();
+    atomic_fetch_add(&g_prog_waiting, 1);
     pthread_mutex_lock(&g_pb.lock);
     while (atomic_load(&e->state) != 2) {
         pthread_cond_wait(&g_pb.done, &g_pb.lock);
     }
     pthread_mutex_unlock(&g_pb.lock);
+    atomic_fetch_sub(&g_prog_waiting, 1);
     g_ns_progwait += diag_now() - t0;
 }
 
