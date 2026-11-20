@@ -1,4 +1,5 @@
 #include <SDL3/SDL.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -712,10 +713,27 @@ static u64 diag_now() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
-static GLuint link_program(GLuint vs, GLuint fs, bool sw, bool uber) {
+// separate programs (ARB_separate_shader_objects, on unless SPIKE_SSO=0): the entry points are past
+// glad's GL 3.3, so they are loaded by hand
+static void (*p_GenProgramPipelines)(GLsizei, GLuint*);
+static void (*p_BindProgramPipeline)(GLuint);
+static void (*p_UseProgramStages)(GLuint, GLbitfield, GLuint);
+static void (*p_ProgramParameteri)(GLuint, GLenum, GLint);
+static void (*p_ProgramUniform1f)(GLuint, GLint, GLfloat);
+static void (*p_ProgramUniform1i)(GLuint, GLint, GLint);
+static bool g_sso;
+
+static void block_binding(GLuint prog, const char* name, GLuint binding) {
+    GLuint idx = glGetUniformBlockIndex(prog, name);
+    if (idx != GL_INVALID_INDEX) glUniformBlockBinding(prog, idx, binding);
+}
+
+// vs or fs may be 0 for a separate program of one stage
+static GLuint link_program_ex(GLuint vs, GLuint fs, bool sw, bool uber, bool separable) {
     auto prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
+    if (separable) p_ProgramParameteri(prog, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    if (vs) glAttachShader(prog, vs);
+    if (fs) glAttachShader(prog, fs);
     glLinkProgram(prog);
     int res;
     glGetProgramiv(prog, GL_LINK_STATUS, &res);
@@ -735,18 +753,16 @@ static GLuint link_program(GLuint vs, GLuint fs, bool sw, bool uber) {
     glUniform1i(glGetUniformLocation(prog, "proctexMapLut"), 6);
     glUniform1i(glGetUniformLocation(prog, "proctexNoiseLut"), 7);
 
-    if (!sw) {
-        glUniformBlockBinding(prog,
-                              glGetUniformBlockIndex(prog, "VertUniforms"), 0);
-        glUniformBlockBinding(
-            prog, glGetUniformBlockIndex(prog, "FreecamUniforms"), 3);
+    if (vs && !sw) {
+        block_binding(prog, "VertUniforms", 0);
+        block_binding(prog, "FreecamUniforms", 3);
     }
-    if (uber)
-        glUniformBlockBinding(prog, glGetUniformBlockIndex(prog, "FragConfig"),
-                              1);
-    glUniformBlockBinding(prog, glGetUniformBlockIndex(prog, "FragUniforms"),
-                          2);
+    if (fs && uber) block_binding(prog, "FragConfig", 1);
+    if (fs) block_binding(prog, "FragUniforms", 2);
     return prog;
+}
+static GLuint link_program(GLuint vs, GLuint fs, bool sw, bool uber) {
+    return link_program_ex(vs, fs, sw, uber, false);
 }
 
 // Programs are built on a helper thread with its own shared context, and each
@@ -765,6 +781,10 @@ typedef struct ProgSrc {
     struct ProgSrc* canon;
     u64 thash;
     struct ProgSrc* tnext;
+    // separate mode: this source's own program, built once for every pair it is in
+    GLuint sep;
+    _Atomic int sstate; // 0 none, 1 building, 2 ready
+    GLint depthloc[3];
 } ProgSrc;
 
 typedef struct ProgEnt {
@@ -774,6 +794,7 @@ typedef struct ProgEnt {
     bool inlist, hot;
     GLuint prog;
     GLint depthloc[3];
+    GLuint pipe; // separate mode: the renderer context's pipeline (pipelines are not shared)
     struct ProgEnt* next;
 } ProgEnt;
 
@@ -882,9 +903,53 @@ static void list_put_src(char type, ProgSrc* p) {
     fwrite(p->src, 1, len, g_pb.list);
 }
 
+// Builds one stage's separate program, or waits while another thread builds it.
+// Mario Kart 7 on the Mali-G52 with the cache off: a vertex program about 280 ms,
+// a fragment program about 11 ms, against about 245 ms for every pair linked
+// together, where the vertex shader is compiled again for each new material.
+static void sep_build(ProgSrc* p, bool vertex, bool helper) {
+    pthread_mutex_lock(&g_pb.lock);
+    while (atomic_load(&p->sstate) == 1) pthread_cond_wait(&g_pb.done, &g_pb.lock);
+    if (atomic_load(&p->sstate) == 2) {
+        pthread_mutex_unlock(&g_pb.lock);
+        return;
+    }
+    atomic_store(&p->sstate, 1);
+    pthread_mutex_unlock(&g_pb.lock);
+
+    GLuint sh = compile_shader(vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER, p->src);
+    GLuint prog = vertex ? link_program_ex(sh, 0, p == g_pb.sw_vs, false, true)
+                         : link_program_ex(0, sh, false, p == g_pb.uber_fs, true);
+    glDetachShader(prog, sh);
+    glDeleteShader(sh);
+    if (vertex) {
+        p->depthloc[0] = glGetUniformLocation(prog, "depthOffset");
+        p->depthloc[1] = glGetUniformLocation(prog, "depthScale");
+        p->depthloc[2] = glGetUniformLocation(prog, "depthWBuffer");
+    }
+    if (helper) {
+        glUseProgram(0);
+        glFinish();
+    } else {
+        g_pb.bound = false;
+    }
+    p->sep = prog;
+    pthread_mutex_lock(&g_pb.lock);
+    atomic_store(&p->sstate, 2);
+    pthread_cond_broadcast(&g_pb.done);
+    pthread_mutex_unlock(&g_pb.lock);
+}
+
 static void prog_build(ProgEnt* e, bool helper) {
     atomic_store(&e->state, 1);
     u64 t0 = diag_now();
+    if (g_sso) {
+        sep_build(e->v, true, helper);
+        sep_build(e->f, false, helper);
+        memcpy(e->depthloc, e->v->depthloc, sizeof e->depthloc);
+        e->prog = e->v->sep; // keys the depth uniform cache
+        goto built;
+    }
     GLuint vs = compile_shader(GL_VERTEX_SHADER, e->v->src);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, e->f->src);
     GLuint prog = link_program(vs, fs, e->v == g_pb.sw_vs, e->f == g_pb.uber_fs);
@@ -910,6 +975,10 @@ static void prog_build(ProgEnt* e, bool helper) {
         g_pb.bound = false;
     }
     e->prog = prog;
+built:;
+    // warm threads build side by side: the counters and the list file are shared
+    static pthread_mutex_t listlock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&listlock);
     g_links++;
     g_ns_shaders += diag_now() - t0;
 
@@ -921,6 +990,7 @@ static void prog_build(ProgEnt* e, bool helper) {
         fwrite(&e->f->hash, sizeof(u64), 1, g_pb.list);
         fflush(g_pb.list);
     }
+    pthread_mutex_unlock(&listlock);
 
     pthread_mutex_lock(&g_pb.lock);
     atomic_store(&e->state, 2);
@@ -929,23 +999,99 @@ static void prog_build(ProgEnt* e, bool helper) {
     pthread_mutex_unlock(&g_pb.lock);
 }
 
-static void* prog_helper(void*) {
-    if (getenv("SPIKE_PIN")) {
+// Warm step. Mesa's disk cache is keyed by the driver build, so after a Mesa
+// update every program of a game links from scratch (about 270 ms each on the
+// Mali-G52): 3D Land froze 25 s in its first level, Mario Kart 7 showed 27 s of
+// black. When the driver differs from the one the game's list was last built
+// with (or the cache folder is empty), the game is held behind the "Preparing
+// graphics" card until every listed program is built, on the helper thread and
+// two more contexts side by side. The stamp is written once that is done.
+// SPIKE_NOWARM=1 skips it, SPIKE_WARMALWAYS=1 forces it (for timing).
+bool (*gpu_gl_warm_bind)(int i);
+int gpu_gl_warm_contexts;
+static _Atomic bool g_warming;
+static int g_pb_building;
+static u64 g_warm_t0;
+static char* g_warm_path;
+static char g_warm_stamp[160];
+
+#define WARM_MAX_NS (90ull * 1000000000ull)
+
+// driver_stamp.c: the loaded gallium library's build id (kept apart: <link.h> clashes with loader.h)
+void gpu_gl_driver_stamp(char* out, int size);
+
+static bool warm_cache_empty() {
+    const char* dir = getenv("MESA_SHADER_CACHE_DIR");
+    if (!dir) return false;
+    DIR* d = opendir(dir);
+    if (!d) return true;
+    int n = 0;
+    for (struct dirent* e; (e = readdir(d));) n += e->d_name[0] != '.';
+    closedir(d);
+    return n == 0;
+}
+
+// with g_pb.lock held
+static void warm_check_done() {
+    if (!atomic_load(&g_warming) || g_pb_building || g_pb.coldpos < g_pb.ncold) return;
+    if (!atomic_exchange(&g_warming, false)) return;
+    atomic_fetch_sub(&g_prog_waiting, 1);
+    pthread_cond_broadcast(&g_pb.wake); // the warm contexts' threads end
+    FILE* f = fopen(g_warm_path, "w");
+    if (f) {
+        fprintf(f, "%s\n", g_warm_stamp);
+        fclose(f);
+    }
+    fprintf(stderr, "spike warm step: %d programs in %.1f s\n", g_pb.ncold,
+            (diag_now() - g_warm_t0) / 1e9);
+}
+
+// the main loop holds the game's frames while this is true
+bool gpu_gl_warming() {
+    if (!atomic_load(&g_warming)) return false;
+    if (diag_now() - g_warm_t0 > WARM_MAX_NS) {
+        // never hold a game for good: the rest builds as the game asks for it
+        fprintf(stderr, "spike warm step: gave up after %d of %d programs\n", g_pb.coldpos,
+                g_pb.ncold);
+        if (atomic_exchange(&g_warming, false)) atomic_fetch_sub(&g_prog_waiting, 1);
+        return false;
+    }
+    return true;
+}
+
+static void* prog_helper(void* arg) {
+    int idx = (int) (intptr_t) arg; // 0 = the helper context, 1.. = warm contexts
+    if (getenv("SPIKE_PIN") && idx == 0) {
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(1, &set);
         pthread_setaffinity_np(pthread_self(), sizeof set, &set);
     }
-    setpriority(PRIO_PROCESS, syscall(SYS_gettid), 5);
-    pthread_setname_np(pthread_self(), "ctremu:prog");
-    gpu_gl_helper_bind();
+    if (idx == 0) setpriority(PRIO_PROCESS, syscall(SYS_gettid), 5);
+    char name[16];
+    snprintf(name, sizeof name, idx ? "ctremu:warm%d" : "ctremu:prog", idx);
+    pthread_setname_np(pthread_self(), name);
+    if (idx == 0) gpu_gl_helper_bind();
+    else if (!gpu_gl_warm_bind(idx - 1)) return nullptr;
     while (true) {
         pthread_mutex_lock(&g_pb.lock);
         ProgEnt* e = nullptr;
         while (!e) {
-            // uber programs first: one of them frees every draw of its vertex
-            // shader from waiting, where an exact program frees one material
-            if (g_pb.nwarm) {
+            bool warm = atomic_load(&g_warming);
+            if (warm && g_pb.coldpos < g_pb.ncold) {
+                // the warm step: the game is held until the list is built
+                e = g_pb.cold[g_pb.coldpos++];
+            } else if (idx > 0) {
+                // warm contexts help only during the warm step
+                if (!warm) {
+                    pthread_mutex_unlock(&g_pb.lock);
+                    return nullptr;
+                }
+                pthread_cond_wait(&g_pb.wake, &g_pb.lock);
+                continue;
+            } else if (g_pb.nwarm) {
+                // uber programs first: one of them frees every draw of its vertex
+                // shader from waiting, where an exact program frees one material
                 e = g_pb.warm[0];
                 memmove(g_pb.warm, g_pb.warm + 1,
                         --g_pb.nwarm * sizeof g_pb.warm[0]);
@@ -959,11 +1105,19 @@ static void* prog_helper(void*) {
                 pthread_cond_wait(&g_pb.wake, &g_pb.lock);
                 continue;
             }
-            if (atomic_load(&e->state) != 0) e = nullptr;
+            if (atomic_load(&e->state) != 0) {
+                e = nullptr;
+                warm_check_done();
+            }
         }
         atomic_store(&e->state, 1);
+        g_pb_building++;
         pthread_mutex_unlock(&g_pb.lock);
         prog_build(e, true);
+        pthread_mutex_lock(&g_pb.lock);
+        g_pb_building--;
+        warm_check_done();
+        pthread_mutex_unlock(&g_pb.lock);
     }
     return nullptr;
 }
@@ -1101,6 +1255,19 @@ static void prog_builder_start() {
     g_pb.sw_vs = src_add(g_pb.vsrc, 1, (char*) gpuvertsource, true);
     g_pb.uber_fs = src_add(g_pb.fsrc, 1, shader_gen_uber_fs(), true);
     g_uber_on = !getenv("SPIKE_NOUBER");
+    const char* sso = getenv("SPIKE_SSO");
+    if (!sso || strcmp(sso, "0")) {
+        p_GenProgramPipelines = (void*) SDL_GL_GetProcAddress("glGenProgramPipelines");
+        p_BindProgramPipeline = (void*) SDL_GL_GetProcAddress("glBindProgramPipeline");
+        p_UseProgramStages = (void*) SDL_GL_GetProcAddress("glUseProgramStages");
+        p_ProgramParameteri = (void*) SDL_GL_GetProcAddress("glProgramParameteri");
+        p_ProgramUniform1f = (void*) SDL_GL_GetProcAddress("glProgramUniform1f");
+        p_ProgramUniform1i = (void*) SDL_GL_GetProcAddress("glProgramUniform1i");
+        g_sso = SDL_GL_ExtensionSupported("GL_ARB_separate_shader_objects") &&
+                p_GenProgramPipelines && p_BindProgramPipeline && p_UseProgramStages &&
+                p_ProgramParameteri && p_ProgramUniform1f && p_ProgramUniform1i;
+        fprintf(stderr, "spike separate programs: %s\n", g_sso ? "on" : "not available");
+    }
     if (getenv("SPIKE_UBERONLY")) ctremu.ubershader = true;
     if (ctremu.romfilenoext && !getenv("SPIKE_NOPROGLIST")) {
         mkdir("shaders", 0777);
@@ -1108,6 +1275,12 @@ static void prog_builder_start() {
         asprintf(&path, "shaders/%s.list", ctremu.romfilenoext);
         prog_list_load(path);
         free(path);
+        gpu_gl_driver_stamp(g_warm_stamp, sizeof g_warm_stamp);
+        // the cache holds separate and linked-together programs under different keys:
+        // switching modes is as cold as a new driver
+        if (g_sso)
+            strncat(g_warm_stamp, " separate", sizeof g_warm_stamp - strlen(g_warm_stamp) - 1);
+        asprintf(&g_warm_path, "shaders/%s.warm", ctremu.romfilenoext);
     }
     if (gpu_gl_helper_bind && !getenv("SPIKE_NOASYNC")) {
         g_pb.on = true;
@@ -1116,7 +1289,36 @@ static void prog_builder_start() {
                 if (v->canon == v) prog_want_uber(v);
             }
         }
-        pthread_create(&g_pb.thread, nullptr, prog_helper, nullptr);
+        if (g_warm_path && !getenv("SPIKE_NOWARM")) {
+            char old[160] = "";
+            FILE* f = fopen(g_warm_path, "r");
+            if (f) {
+                if (!fgets(old, sizeof old, f)) old[0] = 0;
+                old[strcspn(old, "\n")] = 0;
+                fclose(f);
+            }
+            bool cold = strcmp(old, g_warm_stamp) || warm_cache_empty() ||
+                        getenv("SPIKE_WARMALWAYS");
+            fprintf(stderr, "spike warm step: driver %s, list built with %s%s\n", g_warm_stamp,
+                    old[0] ? old : "(none)", cold && g_pb.ncold ? ", warming" : "");
+            if (cold && g_pb.ncold) {
+                g_warm_t0 = diag_now();
+                // the present thread keeps the card up while this counts
+                atomic_fetch_add(&g_prog_waiting, 1);
+                atomic_store(&g_warming, true);
+            } else if (cold && (f = fopen(g_warm_path, "w"))) {
+                fprintf(f, "%s\n", g_warm_stamp);
+                fclose(f);
+            }
+        }
+        pthread_create(&g_pb.thread, nullptr, prog_helper, (void*) (intptr_t) 0);
+        if (atomic_load(&g_warming)) {
+            for (int i = 0; i < gpu_gl_warm_contexts; i++) {
+                pthread_t t;
+                if (!pthread_create(&t, nullptr, prog_helper, (void*) (intptr_t) (i + 1)))
+                    pthread_detach(t);
+            }
+        }
     }
 }
 
@@ -3188,6 +3390,16 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         g_pb.bound = false;
         prog_want_uber(vsrc);
     }
+    // separate programs: a pair whose two stages are both built only needs its pipeline, so
+    // it is made here rather than waiting for its turn on the helper
+    if (g_sso && atomic_load_explicit(&pe->state, memory_order_acquire) == 0 &&
+        atomic_load(&pe->v->sstate) == 2 && atomic_load(&pe->f->sstate) == 2) {
+        int zero = 0;
+        pthread_mutex_lock(&g_pb.lock);
+        bool mine = atomic_compare_exchange_strong(&pe->state, &zero, 1);
+        pthread_mutex_unlock(&g_pb.lock);
+        if (mine) prog_build(pe, false);
+    }
     // the program this draw uses: the exact one, or the uber one of the same
     // vertex shader while the exact one is still building
     ProgEnt* use = pe;
@@ -3219,13 +3431,20 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         gls_BindBufferRange(GL_UNIFORM_BUFFER, 1, g_stream, uoff, sizeof cbuf);
     }
     GLuint prog = use->prog;
-    if (use != pe) {
-        // the next draw looks again: the exact program may be ready by then
-        glUseProgram(prog);
-        g_pb.bound = false;
-    } else if (!g_pb.bound) {
-        glUseProgram(prog);
-        g_pb.bound = true;
+    if (use != pe || !g_pb.bound) {
+        if (g_sso) {
+            if (!use->pipe) {
+                p_GenProgramPipelines(1, &use->pipe);
+                p_UseProgramStages(use->pipe, GL_VERTEX_SHADER_BIT, use->v->sep);
+                p_UseProgramStages(use->pipe, GL_FRAGMENT_SHADER_BIT, use->f->sep);
+            }
+            glUseProgram(0); // a bound program would override the pipeline
+            p_BindProgramPipeline(use->pipe);
+        } else {
+            glUseProgram(prog);
+        }
+        // with the uber stand-in the next draw looks again: the exact program may be ready by then
+        g_pb.bound = use == pe;
     }
     {
         typeof(&g_depth_uni[0]) u = &g_depth_uni[prog & 8191];
@@ -3236,9 +3455,16 @@ void gpu_gl_draw(GPU* gpu, bool elements, bool immediate, DrawSnap* snap) {
         }
         if (!u->sent || u->offset != dmOffset || u->scale != dmScale ||
             u->wbuffer != wbuffer) {
-            glUniform1f(u->loc[0], dmOffset);
-            glUniform1f(u->loc[1], dmScale);
-            glUniform1i(u->loc[2], wbuffer);
+            if (g_sso) {
+                // the depth uniforms are the vertex program's (prog is that program here)
+                p_ProgramUniform1f(prog, u->loc[0], dmOffset);
+                p_ProgramUniform1f(prog, u->loc[1], dmScale);
+                p_ProgramUniform1i(prog, u->loc[2], wbuffer);
+            } else {
+                glUniform1f(u->loc[0], dmOffset);
+                glUniform1f(u->loc[1], dmScale);
+                glUniform1i(u->loc[2], wbuffer);
+            }
             u->offset = dmOffset;
             u->scale = dmScale;
             u->wbuffer = wbuffer;

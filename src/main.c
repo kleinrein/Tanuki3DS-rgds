@@ -314,7 +314,7 @@ static void place_new_threads(const int* before, int nbefore, int cpu, int nice)
             fclose(f);
         }
         if (strncmp(comm, "ctremu:gl", 9)) continue;
-        if (getenv("SPIKE_PIN")) {
+        if (getenv("SPIKE_PIN") && cpu >= 0) {
             cpu_set_t set;
             CPU_ZERO(&set);
             CPU_SET(cpu, &set);
@@ -322,6 +322,17 @@ static void place_new_threads(const int* before, int nbefore, int cpu, int nice)
         }
         if (nice) setpriority(PRIO_PROCESS, now[i], nice);
     }
+}
+// extra shared contexts for the shader warm step (renderer_gl.c), each with its own thread
+#define WARM_CONTEXTS 2
+static SDL_GLContext g_warmctx[WARM_CONTEXTS];
+static bool warm_bind(int i) {
+    if (i < 0 || i >= WARM_CONTEXTS || !g_warmctx[i]) return false;
+    if (!SDL_GL_MakeCurrent(nullptr, g_warmctx[i])) {
+        fprintf(stderr, "spike warm context %d: %s\n", i, SDL_GetError());
+        return false;
+    }
+    return true;
 }
 static void helper_bind() {
     if (!SDL_GL_MakeCurrent(nullptr, g_helperctx)) {
@@ -1253,6 +1264,24 @@ int main(int argc, char** argv) {
         SDL_GL_MakeCurrent(g_window, glcontext);
         if (g_helperctx) gpu_gl_helper_bind = helper_bind;
         else fprintf(stderr, "spike no helper context: %s\n", SDL_GetError());
+        if (g_helperctx && !getenv("SPIKE_NOWARM")) {
+            extern bool (*gpu_gl_warm_bind)(int i);
+            extern int gpu_gl_warm_contexts;
+            SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+            int n = 0;
+            for (int i = 0; i < WARM_CONTEXTS; i++) {
+                ntasks = list_tasks(tasks, 256);
+                g_warmctx[i] = SDL_GL_CreateContext(g_window);
+                // not pinned: the game is held while these build, every core is free
+                place_new_threads(tasks, ntasks, -1, 0);
+                if (!g_warmctx[i]) break;
+                n++;
+            }
+            SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+            SDL_GL_MakeCurrent(g_window, glcontext);
+            gpu_gl_warm_bind = warm_bind;
+            gpu_gl_warm_contexts = n;
+        }
     }
     if (g_window2 && getenv("SPIKE_NOGUI") && !getenv("SPIKE_NOPRESENTTHREAD")) {
         SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
@@ -1444,7 +1473,10 @@ int main(int argc, char** argv) {
         bool menu_held = rgds_bridge_tick();
         if (menu_held) gpu_worker_start_frame(&ctremu.system.gpu);
 
-        if (!ctremu.pause && !menu_held) {
+        // the shader warm step holds the game until its programs are built (renderer_gl.c)
+        extern bool gpu_gl_warming(void);
+        bool warming = gpu_gl_warming();
+        if (!ctremu.pause && !menu_held && !warming) {
             update_input();
             update_mic();
             update_cam();
@@ -1614,7 +1646,7 @@ int main(int argc, char** argv) {
             free(wintitle);
         }
 
-        if (ctremu.fastforward && !ctremu.pause) {
+        if (ctremu.fastforward && !ctremu.pause && !warming) {
             gpu_worker_start_frame(&ctremu.system.gpu);
             while (SDL_GetTicksNS() - prev_frame_time < frame_ticks) {
                 Uint64 frame_start = SDL_GetTicksNS();
