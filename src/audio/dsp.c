@@ -191,16 +191,22 @@ void dsp_process_chn(DSP* dsp, DSPMemory* m, int ch, s32 (*mixer)[2]) {
 
     stat->active = cfg->active;
 
-    u32 nSamples = FRAME_SAMPLES * cfg->rate;
+    // spike: the rate comes from game memory; MK7 hands over 0 now and then. Zero
+    // samples made the interpolation read lsamples[nSamples - 1] = 4 GiB past the
+    // stack (segfault), so clamp the rate and play nothing for that frame
+    float rate = cfg->rate;
+    if (!(rate >= 0)) rate = 0; // NaN and negatives
+    if (rate > 64) rate = 64;
+    u32 nSamples = FRAME_SAMPLES * rate;
 
-    s16 lsamples[nSamples] = {};
-    s16 rsamples[nSamples] = {};
+    s16 lsamples[nSamples ? nSamples : 1] = {};
+    s16 rsamples[nSamples ? nSamples : 1] = {};
     u32 curSample = 0;
 
     s32 lframe[FRAME_SAMPLES] = {};
     s32 rframe[FRAME_SAMPLES] = {};
 
-    if (!stat->active) goto dsp_ch_end;
+    if (!stat->active || !nSamples) goto dsp_ch_end;
 
     update_bufs(dsp, ch, cfg);
     refill_bufs(dsp, ch, cfg);
