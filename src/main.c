@@ -1224,8 +1224,11 @@ int main(int argc, char** argv) {
                                   SDL_WINDOWPOS_UNDEFINED_DISPLAY(d));
             SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_Y_NUMBER,
                                   SDL_WINDOWPOS_UNDEFINED_DISPLAY(d));
-            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, 640);
-            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, 480);
+            // the panel's own mode: 640x480 on the RG DS, 1024x768 on the RG DS Plus
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(d);
+            int pw = mode && mode->w > 0 ? mode->w : 640, ph = mode && mode->h > 0 ? mode->h : 480;
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, pw);
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, ph);
             SDL_SetBooleanProperty(p, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true);
             SDL_SetBooleanProperty(p, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, true);
             SDL_Window* w = SDL_CreateWindowWithProperties(p);
@@ -1233,6 +1236,11 @@ int main(int argc, char** argv) {
             if (i == 0) g_window = w;
             else g_window2 = w;
             fprintf(stderr, "spike window %d on display %u: %p\n", i, d, (void*) w);
+        }
+        if (g_window) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(g_window, &pw, &ph);
+            rgds_bridge_set_panel(pw, ph);
         }
     } else {
         g_window = SDL_CreateWindow("Tanuki3DS", ctremu.windowW, ctremu.windowH,

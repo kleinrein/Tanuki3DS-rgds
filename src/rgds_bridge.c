@@ -87,6 +87,17 @@ static struct {
 } g;
 
 #define PANEL_BYTES (640 * 480 * 4)
+// The launcher's pictures (overlay frames, HUD, the Preparing card, the lid) are 640x480, the RG DS's panels; the
+// RG DS Plus has 1024x768 ones. Those pictures are drawn stretched over the whole panel, and the 3DS screens are laid
+// out in the panel's own pixels.
+static int panel_w = 640, panel_h = 480;
+
+void rgds_bridge_set_panel(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    panel_w = w;
+    panel_h = h;
+    fprintf(stderr, "rgds bridge: panels %dx%d\n", w, h);
+}
 #define OVERLAY_HEAD 64
 #define OVERLAY_BYTES (OVERLAY_HEAD + PANEL_BYTES * 4)
 
@@ -324,8 +335,18 @@ static bool screen_pass(int screen) {
 void rgds_bridge_layout(int panel, Rect* top, Rect* bot) {
     int fit = g.on ? atomic_load(&g.fit) : 0, second = g.on ? atomic_load(&g.second) : 0;
     bool bar = g.on && atomic_load(&g.bar);
-    Rect game = fit == 1 ? (Rect) {120, bar ? 0 : 120, 400, 240} : (Rect) {0, bar ? 0 : 48, 640, 384};
-    Rect full = {0, 0, 640, 480};
+    // Fit 1: the largest whole multiple of 400x240 (1x on 640x480, 2x on 1024x768); otherwise the panel's width
+    // (1.6x on the RG DS, 2.56x on the Plus). Centred, or at the top above a bar.
+    Rect game;
+    if (fit == 1) {
+        int n = panel_w / 400 < panel_h / 240 ? panel_w / 400 : panel_h / 240;
+        if (n < 1) n = 1;
+        game = (Rect) {(panel_w - 400 * n) / 2, bar ? 0 : (panel_h - 240 * n) / 2, 400 * n, 240 * n};
+    } else {
+        int h = panel_w * 240 / 400;
+        game = (Rect) {0, bar ? 0 : (panel_h - h) / 2, panel_w, h};
+    }
+    Rect full = {0, 0, panel_w, panel_h};
     *top = (Rect) {};
     *bot = (Rect) {};
     // Off: the lower panel stays dark; Swap: each screen on the other panel
@@ -645,15 +666,24 @@ bool rgds_bridge_tick() {
 
 static void write_capture(int panel) {
     // the save gallery's picture (the top panel) and make shot's (both): 32-bit BMP, bottom row first as GL reads it
-    static u8 px[PANEL_BYTES];
-    glReadPixels(0, 0, 640, 480, GL_BGRA, GL_UNSIGNED_BYTE, px);
-    for (int i = 3; i < PANEL_BYTES; i += 4) px[i] = 255;
+    // at the panel's own size (DSCore's captures are too)
+    static u8* px;
+    static int px_bytes;
+    const int bytes = panel_w * panel_h * 4;
+    if (px_bytes != bytes) {
+        free(px);
+        px = malloc(bytes);
+        px_bytes = px ? bytes : 0;
+        if (!px) return;
+    }
+    glReadPixels(0, 0, panel_w, panel_h, GL_BGRA, GL_UNSIGNED_BYTE, px);
+    for (int i = 3; i < bytes; i += 4) px[i] = 255;
     u8 head[54] = {'B', 'M'};
-    u32 size = 54 + PANEL_BYTES;
+    u32 size = 54 + bytes;
     memcpy(head + 2, &size, 4);
     head[10] = 54;
     head[14] = 40;
-    u32 w = 640, h = 480;
+    u32 w = panel_w, h = panel_h;
     memcpy(head + 18, &w, 4);
     memcpy(head + 22, &h, 4);
     head[26] = 1;
@@ -664,7 +694,7 @@ static void write_capture(int panel) {
     FILE* f = fopen(pending, "wb");
     if (f) {
         fwrite(head, 1, 54, f);
-        fwrite(px, 1, PANEL_BYTES, f);
+        fwrite(px, 1, bytes, f);
         fclose(f);
         rename(pending, path);
     }
@@ -779,12 +809,13 @@ static bool panel_ground() {
     if (change != g.lid_drawn || fit != g.lid_fit) {
         g.lid_drawn = change;
         g.lid_fit = fit;
-        Rect r = ctremu.screens[SCREEN_TOP];
-        rgds_bezel_draw(g.lid_pixels, g.lid, r.x, r.y, r.w, r.h);
+        Rect r = ctremu.screens[SCREEN_TOP]; // panel pixels; the lid's picture is 640x480
+        rgds_bezel_draw(g.lid_pixels, g.lid, r.x * 640 / panel_w, r.y * 480 / panel_h, r.w * 640 / panel_w,
+                        r.h * 480 / panel_h);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 640, 480, GL_RGBA, GL_UNSIGNED_BYTE, g.lid_pixels);
     }
     glUseProgram(g.prog);
-    glViewport(0, 0, 640, 480);
+    glViewport(0, 0, panel_w, panel_h);
     glUniform1i(g.use_tex, 1);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     return true;
@@ -795,7 +826,7 @@ extern bool rgds_hud_preparing(unsigned char* pixels, int tick);
 
 void rgds_bridge_preparing(int panel, int tick) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, 640, 480);
+    glViewport(0, 0, panel_w, panel_h);
     glDisable(GL_SCISSOR_TEST);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -867,7 +898,7 @@ void rgds_bridge_panel(int panel) {
     glActiveTexture(GL_TEXTURE0);
     bool picture = show && (panel == 0 ? overlay_refresh() : g.have_picture);
     glUseProgram(g.prog);
-    glViewport(0, 0, 640, 480);
+    glViewport(0, 0, panel_w, panel_h);
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);

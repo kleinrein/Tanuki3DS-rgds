@@ -21,6 +21,8 @@ void rgds_crash_note(const char* what, void* addr, void* pc, void* lr);
 // The Graphics page's choices, on the renderer thread before a panel is drawn.
 int rgds_bridge_filter();
 void rgds_bridge_layout(int panel, Rect* top, Rect* bot);
+// The panels' size in pixels (640x480 on the RG DS, 1024x768 on the RG DS Plus), once the windows exist.
+void rgds_bridge_set_panel(int w, int h);
 // On the present thread, while the game waits for its GPU programs: a dark panel, the top one with a
 // "Preparing graphics" card that `tick` animates.
 void rgds_bridge_preparing(int panel, int tick);
