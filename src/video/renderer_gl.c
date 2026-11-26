@@ -1521,7 +1521,10 @@ void gpu_gl_state_loaded(GPU* gpu, GPU* from, const u8* blob) {
         fb->color_Bpp = BLOB_GET(u32);
         fb->depth_fmt = BLOB_GET(u32);
         fb->shadowMap = BLOB_GET(u8);
-        fb->dirty = BLOB_GET(u8);
+        // the saved dirty flag is not used: every texture comes from guest memory again, so every
+        // render-to-texture copy has to run again
+        BLOB_GET(u8);
+        fb->dirty = true;
         blob = fields + FB_FIELDS;
         u32 w = fb->width * ctremu.videoscale, h = fb->height * ctremu.videoscale;
         // saved at another resolution: the game draws the picture again on its next frame
@@ -2614,6 +2617,8 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
     }
 
     u32 texsize = texsize_total(regs, fmt);
+    // a texture rebuilt from guest memory below has lost what a framebuffer drew into it
+    int creates_before = g_tex_creates;
 
     // spike: the cache is a list searched from the front, 256 entries long, and every draw looks
     // its textures up (a twelfth of this thread in Mario Kart 7): a hint by address first
@@ -2761,8 +2766,10 @@ static void load_texture(GPU* gpu, FragConfig* fcfg, int id, TexUnitRegs* regs,
             }
         }
     }
-    if (fb && fb->dirty) {
-        // only read from a framebuffer if its been modified since the last time
+    // Only read from a framebuffer if it has been modified since the last time, or if the texture
+    // was just rebuilt from guest memory, which never holds what the GPU drew (Mario Kart 7 draws
+    // its place sign once per place change: after a state load it stayed garbage until then).
+    if (fb && (fb->dirty || g_tex_creates != creates_before)) {
         fb->dirty = false;
         linfo("rtt at %08x", fb->color_paddr);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fb->fbo);
